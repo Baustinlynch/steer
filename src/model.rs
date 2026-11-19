@@ -1,0 +1,35 @@
+use crate::prompt::PromptInfo;
+use chrono::{DateTime, Utc};
+
+/// One thing that happened in an agent session, either by the human or by the agent.
+pub enum EventKind {
+    /// The human sent a prompt. Only derived features are kept, never the text.
+    Prompt(PromptInfo),
+    /// The human stopped the agent mid-turn.
+    Interrupt,
+    /// The human ran a shell command themselves (e.g. `!npm test` in Claude Code).
+    Shell,
+    /// The human ran a slash command.
+    Command,
+    /// The human rejected a tool call the agent wanted to make.
+    Rejected,
+    /// The agent produced output or got a tool result back.
+    Agent { tools: Vec<String> },
+}
+
+pub struct Event {
+    pub t: DateTime<Utc>,
+    pub kind: EventKind,
+}
+
+impl Event {
+    pub fn is_human(&self) -> bool {
+        !matches!(self.kind, EventKind::Agent { .. })
+    }
+}
+
+pub struct Session {
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+    pub events: Vec<Event>,
+}

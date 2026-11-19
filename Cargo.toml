@@ -1,0 +1,15 @@
+[package]
+name = "steer"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "tracks how much time you spend working with ai agents"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
