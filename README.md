@@ -32,4 +32,4 @@ the "how it counts" part at the bottom of the report explains it, and the code i
 
 ## license
 
-AGPL-3.0
+AGPL-3.0-or-later, see LICENSE
