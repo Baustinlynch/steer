@@ -63,7 +63,8 @@ pub fn parse_session(path: &Path) -> Option<Session> {
             cwd = str_field(&v, "cwd");
         }
         let event = if ty == "assistant" { assistant_event(&v, t) } else { user_event(&v, t) };
-        if let Some(e) = event {
+        if let Some(mut e) = event {
+            e.id = v.get("uuid").and_then(Value::as_str).map(hash_id);
             events.push(e);
         }
     }
@@ -90,7 +91,7 @@ fn assistant_event(v: &Value, t: DateTime<Utc>) -> Option<Event> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(Event { t, kind: EventKind::Agent { tools } })
+    Some(Event { id: None, t, kind: EventKind::Agent { tools } })
 }
 
 fn user_event(v: &Value, t: DateTime<Utc>) -> Option<Event> {
@@ -112,7 +113,7 @@ fn user_event(v: &Value, t: DateTime<Utc>) -> Option<Event> {
             } else {
                 EventKind::Agent { tools: Vec::new() }
             };
-            return Some(Event { t, kind });
+            return Some(Event { id: None, t, kind });
         }
     }
 
@@ -157,7 +158,7 @@ fn user_event(v: &Value, t: DateTime<Utc>) -> Option<Event> {
     } else {
         EventKind::Prompt(PromptInfo::analyze(text, images))
     };
-    Some(Event { t, kind })
+    Some(Event { id: None, t, kind })
 }
 
 fn extract_text(content: &Value) -> (String, usize) {
@@ -200,6 +201,13 @@ fn strip_tag(s: &str, tag: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+fn hash_id(id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
 }
 
 fn flag(v: &Value, key: &str) -> bool {

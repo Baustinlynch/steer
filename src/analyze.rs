@@ -29,7 +29,7 @@ const LOOP_GAP: i64 = 900;
 /// How many in a row before it's flagged.
 const LOOP_MIN: usize = 3;
 
-pub const TOOL_GROUPS: [&str; 7] = ["edits", "commands", "reads", "browser", "web", "subagents", "other"];
+pub const TOOL_GROUPS: [&str; 7] = ["edit", "command", "read", "browser action", "web search", "subagent", "other call"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TurnKind {
@@ -283,10 +283,10 @@ mod tests {
         DateTime::from_timestamp(1_800_000_000 + min * 60 + sec, 0).unwrap()
     }
     fn prompt(t: DateTime<Utc>, text: &str) -> Event {
-        Event { t, kind: EventKind::Prompt(PromptInfo::analyze(text, 0)) }
+        Event { id: None, t, kind: EventKind::Prompt(PromptInfo::analyze(text, 0)) }
     }
     fn agent(t: DateTime<Utc>) -> Event {
-        Event { t, kind: EventKind::Agent { tools: vec!["Edit".into()] } }
+        Event { id: None, t, kind: EventKind::Agent { tools: vec!["Edit".into()] } }
     }
     fn run(events: Vec<Event>) -> SessionReport {
         analyze(&Session { cwd: None, title: None, events }, &[])

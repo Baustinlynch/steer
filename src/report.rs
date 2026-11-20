@@ -216,7 +216,7 @@ fn render_turn(h: &mut String, t: &Turn, start_day: NaiveDate) {
         .iter()
         .zip(t.tools.iter())
         .filter(|(_, n)| **n > 0)
-        .map(|(g, n)| format!("{n} {g}"))
+        .map(|(g, n)| plural(*n, g))
         .collect();
 
     let _ = write!(

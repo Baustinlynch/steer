@@ -70,8 +70,15 @@ fn main() {
     let mut commit_cache: BTreeMap<PathBuf, Vec<DateTime<Utc>>> = BTreeMap::new();
     let mut by_name: BTreeMap<String, report::Project> = BTreeMap::new();
 
-    for file in &files {
-        let Some(session) = claude::parse_session(file) else { continue };
+    // Resumed or forked sessions copy old entries into a new file. Go through sessions
+    // oldest first and keep each entry only the first time it shows up, so the same
+    // time isn't counted twice.
+    let mut sessions: Vec<model::Session> = files.iter().filter_map(|f| claude::parse_session(f)).collect();
+    sessions.sort_by_key(|s| s.events.first().map(|e| e.t));
+    let mut seen = std::collections::HashSet::new();
+
+    for mut session in sessions {
+        session.events.retain(|e| e.id.map_or(true, |id| seen.insert(id)));
         let Some(last) = session.events.last().map(|e| e.t) else { continue };
         if cutoff.is_some_and(|c| last < c) {
             continue;

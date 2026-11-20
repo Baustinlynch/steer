@@ -18,6 +18,9 @@ pub enum EventKind {
 }
 
 pub struct Event {
+    /// Hash of the log entry's id. Resumed or forked sessions copy old entries into a
+    /// new file, so this is used to count each entry only once.
+    pub id: Option<u64>,
     pub t: DateTime<Utc>,
     pub kind: EventKind,
 }
