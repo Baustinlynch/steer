@@ -52,7 +52,7 @@ export function analyzePrompt(text, images) {
 const typingSecs = (p) => Math.min(300, Math.max(5, Math.round(p.chars / 4)));
 
 function similarity(a, b) {
-  if (a.wordSet.size === 0 || b.wordSet.size === 0) return 0;
+  if (!a.wordSet || !b.wordSet || a.wordSet.size === 0 || b.wordSet.size === 0) return 0;
   let shared = 0;
   for (const w of a.wordSet) if (b.wordSet.has(w)) shared++;
   return shared / (a.wordSet.size + b.wordSet.size - shared);
@@ -280,7 +280,9 @@ export function analyzeSession(session) {
       case "prompt": {
         const p = e.prompt;
         const tested = p.observation || ranCommand;
-        const repeat = lastPrompt !== null && p.words >= 3 && similarity(p, lastPrompt) >= 0.6;
+        // Live events don't carry the words, so the client works out "repeat" itself.
+        const repeat =
+          typeof p.repeat === "boolean" ? p.repeat : lastPrompt !== null && p.words >= 3 && similarity(p, lastPrompt) >= 0.6;
         if (p.images > 0) tags.push("screenshot");
         else if (p.observation) tags.push("reported a result");
         if (ranCommand) tags.push("ran a command first");
@@ -452,7 +454,10 @@ const ACTIONS = {
 };
 
 /** The report itself, as an HTML fragment. */
-export function renderReport(projects, { window: span, hideTitles = false, source = "your Claude Code logs" }) {
+export function renderReport(
+  projects,
+  { window: span, hideTitles = false, source = "your Claude Code logs", sessions: showSessions = true, projectLink = null },
+) {
   const human = sum(projects, projectHuman);
   const agent = sum(projects, projectAgent);
   const flagged = sum(projects, projectFlagged);
@@ -477,9 +482,11 @@ export function renderReport(projects, { window: span, hideTitles = false, sourc
   for (const p of projects) {
     const ph = projectHuman(p);
     const pa = projectAgent(p);
-    h += `<tr><td>${esc(p.name)}</td><td class="r">${p.sessions.length}</td><td class="r">${fmtDur(ph)}</td><td class="r">${fmtDur(pa)}</td><td class="r">${fmtDur(Math.trunc(pa / 3))}</td><td class="bars"><div class="bar you" style="width:${pct(ph, scale).toFixed(2)}%"></div><div class="bar agent" style="width:${pct(pa, scale).toFixed(2)}%"></div></td></tr>\n`;
+    const name = projectLink ? `<a href="${esc(projectLink(p.name))}">${esc(p.name)}</a>` : esc(p.name);
+    h += `<tr><td>${name}</td><td class="r">${p.sessions.length}</td><td class="r">${fmtDur(ph)}</td><td class="r">${fmtDur(pa)}</td><td class="r">${fmtDur(Math.trunc(pa / 3))}</td><td class="bars"><div class="bar you" style="width:${pct(ph, scale).toFixed(2)}%"></div><div class="bar agent" style="width:${pct(pa, scale).toFixed(2)}%"></div></td></tr>\n`;
   }
   h += "</table></div>\n";
+  if (!showSessions) return h;
 
   h += `<h2>Sessions</h2>\n<p class="muted">In each bar, black is your time, gray is agent time and red is dark flow. Breaks are left out.</p>\n`;
   for (const p of projects) {
@@ -514,7 +521,7 @@ function renderSession(s, hideTitles) {
     notes.push(...t.tags);
     let noteText = notes.join(", ");
     if (t.darkFlow) noteText += (noteText ? ", " : "") + '<span class="red">dark flow</span>';
-    const you = t.darkFlow ? `${fmtDur(t.human)} (was ${fmtDur(t.human + t.flagged)})` : fmtDur(t.human);
+    const you = t.darkFlow && t.flagged > 0 ? `${fmtDur(t.human)} (was ${fmtDur(t.human + t.flagged)})` : fmtDur(t.human);
     const did = TOOL_GROUPS.map((g, i) => [g, t.tools[i]]).filter(([, n]) => n > 0).map(([g, n]) => plural(n, g));
     h += `<tr${t.darkFlow ? ' class="flow"' : ""}><td>${when}</td><td>${action}</td><td>${noteText}</td><td class="r">${you}</td><td class="r">${t.agent > 0 ? fmtDur(t.agent) : ""}</td><td>${did.join(", ")}</td></tr>\n`;
   }

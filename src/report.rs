@@ -206,7 +206,7 @@ fn render_turn(h: &mut String, t: &Turn, start_day: NaiveDate) {
         notes.push_str("<span class=\"red\">dark flow</span>");
     }
 
-    let you = if t.dark_flow {
+    let you = if t.dark_flow && t.flagged_secs > 0 {
         format!("{} (was {})", fmt_dur(t.human_secs), fmt_dur(t.human_secs + t.flagged_secs))
     } else {
         fmt_dur(t.human_secs)

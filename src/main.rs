@@ -1,6 +1,7 @@
 mod analyze;
 mod claude;
 mod git;
+mod live;
 mod model;
 mod prompt;
 mod report;
@@ -16,21 +17,25 @@ struct Args {
     hide_titles: bool,
 }
 
-const HELP: &str = "steer: shows how much time you spent working with your ai agent, from your claude code logs
+const HELP: &str = "steer: shows how much time you spent working with your ai agent
 
-usage: steer [--days N | --all] [--out FILE] [--hide-titles] [--root DIR]
+report from your old claude code logs (runs on your computer, nothing gets uploaded):
+  steer [report] [--days N | --all] [--out FILE] [--hide-titles] [--root DIR]
 
   --days N        only sessions active in the last N days (default 30)
   --all           every session
   --out FILE      where to write the HTML report (default steer-report.html)
   --hide-titles   don't show session titles in the report
   --root DIR      Claude Code projects folder (default ~/.claude/projects)
+";
 
-runs on your computer, nothing gets uploaded";
+fn help() -> String {
+    format!("{HELP}\n{}", live::HELP)
+}
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut a = Args { days: Some(30), out: PathBuf::from("steer-report.html"), root: None, hide_titles: false };
-    let mut it = std::env::args().skip(1);
+    let mut it = args.iter().cloned();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--days" => {
@@ -42,7 +47,7 @@ fn parse_args() -> Result<Args, String> {
             "--root" => a.root = Some(PathBuf::from(it.next().ok_or("--root needs a folder")?)),
             "--hide-titles" => a.hide_titles = true,
             "-h" | "--help" => {
-                println!("{HELP}");
+                println!("{}", help());
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -52,8 +57,21 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
-    let args = parse_args().unwrap_or_else(|e| {
-        eprintln!("steer: {e}\n\n{HELP}");
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some("hook") => return live::hook(),
+        Some("signup" | "login" | "setup" | "status" | "flush") => std::process::exit(live::command(&argv)),
+        Some("report") => {
+            argv.remove(0);
+        }
+        _ => {}
+    }
+    report(&argv);
+}
+
+fn report(argv: &[String]) {
+    let args = parse_args(argv).unwrap_or_else(|e| {
+        eprintln!("steer: {e}\n\n{}", help());
         std::process::exit(2);
     });
     let root = args.root.clone().or_else(claude::default_root).unwrap_or_else(|| {

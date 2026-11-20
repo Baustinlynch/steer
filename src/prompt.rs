@@ -71,12 +71,23 @@ impl PromptInfo {
 
     /// Word-overlap similarity (0 to 1) with another prompt.
     pub fn similarity(&self, other: &Self) -> f64 {
-        if self.word_hashes.is_empty() || other.word_hashes.is_empty() {
+        self.similarity_to(&other.word_hashes)
+    }
+
+    /// Same as `similarity`, against word hashes saved from an earlier prompt.
+    pub fn similarity_to(&self, other: &HashSet<u64>) -> f64 {
+        if self.word_hashes.is_empty() || other.is_empty() {
             return 0.0;
         }
-        let shared = self.word_hashes.intersection(&other.word_hashes).count() as f64;
-        let total = self.word_hashes.union(&other.word_hashes).count() as f64;
+        let shared = self.word_hashes.intersection(other).count() as f64;
+        let total = self.word_hashes.union(other).count() as f64;
         shared / total
+    }
+
+    /// The prompt's word hashes, so the next prompt can be compared to it later.
+    /// These stay on this computer.
+    pub fn word_hashes(&self) -> &HashSet<u64> {
+        &self.word_hashes
     }
 }
 
