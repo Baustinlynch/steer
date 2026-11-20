@@ -72,6 +72,8 @@ PORT=8790 STEER_DATA=./data node server/server.mjs
 
 then `steer signup NAME --server https://your.server`.
 
+behind a proxy that isn't on the same machine, set `TRUSTED_PROXIES` to its address so the per ip limits see the real visitor and not the proxy.
+
 ## license
 
 AGPL-3.0-or-later, see LICENSE

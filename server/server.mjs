@@ -307,18 +307,22 @@ const loginStarts = new Buckets(20, 1 / 30); // per IP: 20 logins, then one ever
 const codeTries = new Buckets(20, 1 / 30); // per IP, typing the code from the terminal
 const signups = new Buckets(10, 1 / 360); // per IP: 10, then one every 6 minutes
 
-const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+// Proxies whose X-Forwarded-For is believed: this machine, plus TRUSTED_PROXIES (comma
+// separated). On Nest the proxy isn't on this machine, it connects from 10.60.1.2, so
+// that address goes in TRUSTED_PROXIES there.
+const TRUSTED = new Set(["127.0.0.1", "::1", ...(process.env.TRUSTED_PROXIES ?? "").split(",").map((s) => s.trim()).filter(Boolean)]);
+const trusted = (ip) => TRUSTED.has(ip) || (ip.startsWith("::ffff:") && TRUSTED.has(ip.slice(7)));
 
 /**
- * Who's asking, for the per-IP limits. Behind the proxy on Nest every connection comes
- * from 127.0.0.1 and the proxy puts the real address last in X-Forwarded-For. That
- * header is only believed from 127.0.0.1, anyone else could make it up. IPv6
- * addresses are grouped by /64, since one person usually has a whole /64.
+ * Who's asking, for the per-IP limits. Behind a proxy every connection comes from the
+ * proxy, which puts the real address last in X-Forwarded-For. That header is only
+ * believed from a trusted proxy, anyone else could make it up. IPv6 addresses are
+ * grouped by /64, since one person usually has a whole /64.
  */
 function clientIp(req) {
   let ip = req.socket.remoteAddress ?? "";
   const fwd = req.headers["x-forwarded-for"];
-  if (LOOPBACK.has(ip) && typeof fwd === "string" && fwd.trim()) ip = fwd.split(",").at(-1).trim().slice(0, 64);
+  if (trusted(ip) && typeof fwd === "string" && fwd.trim()) ip = fwd.split(",").at(-1).trim().slice(0, 64);
   if (ip.startsWith("::ffff:") && ip.includes(".")) return ip.slice(7);
   if (!ip.includes(":")) return ip;
   const [head, tail] = ip.split("%")[0].toLowerCase().split("::");
