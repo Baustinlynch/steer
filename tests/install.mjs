@@ -44,6 +44,8 @@ async function steer(exe, args, { input, allowFail } = {}) {
   let out = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (out += d));
+  // Commands that don't read stdin can exit before it's written. That's fine.
+  child.stdin.on("error", () => {});
   child.stdin.end(input ?? "");
   const closed = new Promise((ok) => child.on("close", () => ok(true)));
   const timer = setTimeout(() => child.kill(), 60_000);
