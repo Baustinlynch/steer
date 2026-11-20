@@ -1,6 +1,8 @@
 //! Builds the HTML report. Prompt text never gets here.
 
-use crate::analyze::{SessionReport, Turn, TurnKind, TOOL_GROUPS};
+use crate::analyze::{
+    SessionReport, Turn, TurnKind, Why, LOOP_GAP, LOW_INFO_CAP, REVIEW_CAP, TESTED_CAP, TOOL_GROUPS, WATCH_WINDOW,
+};
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use std::fmt::Write;
 
@@ -190,20 +192,9 @@ fn render_turn(h: &mut String, t: &Turn, start_day: NaiveDate) {
         TurnKind::Rejected => "Rejected tool call".into(),
     };
 
-    let mut notes: Vec<String> = Vec::new();
-    if t.break_before {
-        notes.push("after break".into());
-    }
-    notes.extend(t.tags.iter().map(|s| s.to_string()));
+    let (notes, mut more) = note(t);
     if t.commits > 0 {
-        notes.push(plural(t.commits, "commit"));
-    }
-    let mut notes = notes.join(", ");
-    if t.dark_flow {
-        if !notes.is_empty() {
-            notes.push_str(", ");
-        }
-        notes.push_str("<span class=\"red\">dark flow</span>");
+        let _ = write!(more, "\n{} before your next action.", plural(t.commits, "commit"));
     }
 
     let you = if t.dark_flow && t.flagged_secs > 0 {
@@ -221,10 +212,203 @@ fn render_turn(h: &mut String, t: &Turn, start_day: NaiveDate) {
 
     let _ = write!(
         h,
-        "<tr{row}><td>{when}</td><td>{action}</td><td>{notes}</td><td class=\"r\">{you}</td><td class=\"r\">{agent}</td><td>{did}</td></tr>\n",
+        "<tr{row}><td>{when}</td><td>{action}</td><td title=\"{more}\">{notes}</td><td class=\"r\">{you}</td><td class=\"r\">{agent}</td><td>{did}</td></tr>\n",
         row = if t.dark_flow { " class=\"flow\"" } else { "" },
+        more = esc(&more),
         did = did.join(", "),
     );
+}
+
+/// Seconds for the hover text: "40s", "9m 12s", "1h 05m".
+fn exact(secs: i64) -> String {
+    let s = secs.max(0);
+    match (s / 3600, s % 3600 / 60, s % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, 0) => format!("{m}m"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, m, _) => format!("{h}h {m:02}m"),
+    }
+}
+
+/// Like fmt_dur, but 0 is "0s".
+fn ago(secs: i64) -> String {
+    if secs <= 0 {
+        "0s".into()
+    } else {
+        fmt_dur(secs)
+    }
+}
+
+/// What a prompt tag means, in words.
+fn tag_words(tag: &str) -> &str {
+    match tag {
+        "screenshot" => "has a screenshot",
+        "reported a result" => "says what happened",
+        "ran a command first" => "you ran a command first",
+        "specific" => "names files or code",
+        "low info" => "short, like \"continue\"",
+        "repeat" => "almost the same as your last prompt",
+        other => other,
+    }
+}
+
+/// How the prompt shows you tested something, if it does. Same as `tested` in analyze.
+fn tested_how(t: &Turn) -> Option<&'static str> {
+    if t.tags.contains(&"screenshot") {
+        Some("you sent a screenshot")
+    } else if t.tags.contains(&"reported a result") {
+        Some("you said what happened")
+    } else if t.tags.contains(&"ran a command first") {
+        Some("you ran a command first")
+    } else {
+        None
+    }
+}
+
+/// Why a turn got the time it did: a short line for the notes column (HTML), and more
+/// detail for hovering over it (plain text). web/steer.js has the same words in turnNote.
+pub fn note(t: &Turn) -> (String, String) {
+    // Time before dark flow cut it down.
+    let base = t.human_secs + t.flagged_secs;
+    let since = if t.from_agent { "after the agent stopped" } else { "after your last action" };
+    let short_prompt = t.tags.contains(&"low info");
+    let tested = tested_how(t);
+    let cap_why = |cap: i64| match (cap, tested) {
+        (TESTED_CAP, Some(how)) => format!(" it's {} because {how}.", exact(cap)),
+        (LOW_INFO_CAP, _) => format!(" it's {} because it's a short prompt like \"continue\".", exact(cap)),
+        _ => String::new(),
+    };
+
+    let (mut short, mut long) = match (t.kind, t.why) {
+        (TurnKind::Prompt, Why::First) => (
+            "first prompt, just typing time".to_string(),
+            format!("nothing before it to measure from, so only typing time counts ({}).", exact(t.typed)),
+        ),
+        (_, Why::First) => (
+            format!("first action, counts {}", ago(base)),
+            format!("nothing before it to measure from, so it gets a flat {}.", exact(base)),
+        ),
+        (_, Why::Break { gap, cap, back }) => {
+            let came = format!("your prompt came {} {since}", exact(gap));
+            if base == t.typed + back {
+                let short = match tested {
+                    Some(_) => format!("back after a break, tested: {} + typing", ago(back)),
+                    None => format!("back after a break: {} + typing", ago(back)),
+                };
+                let long = format!(
+                    "{came}, over the {} max, so it counts as a break. we can't tell when you came back, so {} to catch up plus typing ({}) counts.{}",
+                    exact(cap),
+                    exact(back),
+                    exact(t.typed),
+                    tested.map_or(String::new(), |how| format!(
+                        " the max is {} and catch-up is {} because {how}.",
+                        exact(cap),
+                        exact(back)
+                    )),
+                );
+                (short, long)
+            } else if base > t.typed {
+                let short = if short_prompt {
+                    format!("short prompt after a break, capped at {}", ago(cap))
+                } else {
+                    format!("back after a break, capped at {}", ago(cap))
+                };
+                (short, format!("{came}, over the {} max.{}", exact(cap), cap_why(cap)))
+            } else {
+                (
+                    "typing time, longer than the max".to_string(),
+                    format!("{came}, over the {} max, but typing it takes about {}.", exact(cap), exact(t.typed)),
+                )
+            }
+        }
+        (_, Why::Reply { gap, watch, .. }) if watch > 0 => (
+            format!("replied {} {since} + {} watching", ago(gap), ago(watch)),
+            format!(
+                "you replied {} {since}. that's within {}, so you were probably watching it work, and {} of its run time counts too.",
+                exact(gap),
+                exact(WATCH_WINDOW),
+                exact(watch),
+            ),
+        ),
+        (_, Why::Reply { gap, cap, .. }) => {
+            let short = if tested.is_some() && gap > REVIEW_CAP {
+                format!("tested, replied {} {since}", ago(gap))
+            } else {
+                format!("replied {} {since}", ago(gap))
+            };
+            let long = if t.from_agent {
+                format!("the {} between the agent stopping and your prompt counts, up to {}.", exact(gap), exact(cap))
+            } else {
+                format!(
+                    "the agent didn't do anything after your last action, so the {} since then counts, up to {}.",
+                    exact(gap),
+                    exact(cap)
+                )
+            };
+            (short, long + &cap_why(cap))
+        }
+        (_, Why::Typing { gap, watch }) => (
+            "typing time, longer than the wait".to_string(),
+            format!(
+                "you replied {} {since}{}, but typing it takes about {}, so typing time counts.",
+                exact(gap),
+                if watch > 0 { format!(" (+{} watching)", exact(watch)) } else { String::new() },
+                exact(t.typed),
+            ),
+        ),
+        (_, Why::Wall { wall }) => (
+            format!("{} since your last action", ago(wall)),
+            "it can't count more than the time since your last action.".to_string(),
+        ),
+        (kind, Why::Clamped { secs, min, max }) => {
+            let (since, from) = match (kind, t.from_agent) {
+                (TurnKind::Rejected, true) => ("after the agent asked", "since the agent asked"),
+                (_, true) => (since, "since the agent stopped"),
+                (_, false) => (since, "since your last action"),
+            };
+            let short = if secs > max {
+                format!("{} {since}, capped at {}", exact(secs), ago(max))
+            } else if secs < min {
+                format!("under {}, counts as {}", ago(min), ago(min))
+            } else {
+                format!("{} {since}", ago(secs))
+            };
+            let range = format!("{} to {}", exact(min), exact(max));
+            let long = match kind {
+                TurnKind::Interrupt => {
+                    format!("stopping the agent means you were watching it, so the time {from} counts, {range}.")
+                }
+                TurnKind::Shell => format!(
+                    "you ran a command yourself, so the time {from} counts, {range}. your next prompt counts as tested."
+                ),
+                TurnKind::Command => format!("slash commands count the time {from}, {range}."),
+                TurnKind::Rejected => format!("you read what the agent wanted to do and said no. the time {from} counts, {range}."),
+                TurnKind::Prompt => format!("the time {from} counts, {range}."),
+            };
+            (short, long)
+        }
+    };
+
+    if t.dark_flow {
+        let was = format!(" it would have been {}: {short}.", exact(base));
+        short = format!(
+            "<span class=\"red\">dark flow</span>: {} prompt in a run of {}, typing only",
+            if short_prompt { "short" } else { "repeat" },
+            t.run
+        );
+        long = format!(
+            "{} short or repeat prompts in a row, each within {} of the last, and none show testing. that looks like hitting retry, so only typing time counts ({}).{}",
+            t.run,
+            exact(LOOP_GAP),
+            exact(t.typed),
+            if t.flagged_secs > 0 { was } else { String::new() },
+        );
+    }
+    if t.kind == TurnKind::Prompt && !t.tags.is_empty() {
+        let words: Vec<&str> = t.tags.iter().map(|s| tag_words(s)).collect();
+        let _ = write!(long, "\nprompt: {}", words.join(", "));
+    }
+    (short, long)
 }
 
 const HEAD: &str = r#"<!doctype html>
@@ -274,12 +458,84 @@ li{margin:3px 0}
 const HOW: &str = r#"<h2>How it counts</h2>
 <ul>
 <li>Your time comes from things you do: prompts, stopping the agent, rejecting a tool call, running a command.</li>
-<li>Time between the agent finishing and your next prompt counts, up to 10 min. Up to 20 min if the prompt has a screenshot, describes what happened, or you ran a command first. Up to 2 min for prompts like "continue".</li>
-<li>A longer gap is a break. Then only 2 min plus typing time counts (5 min if you tested something).</li>
+<li>Time between the agent finishing and your next prompt counts, up to 10 min. Up to 20 min if the prompt has a screenshot, describes what happened, or you ran a command first. Up to 2 min for short prompts like "continue" (3 words or less with no file names, numbers or code).</li>
+<li>A longer gap is a break. Then only 2 min plus typing time counts (5 min if you tested something). Short prompts get 2 min at most.</li>
 <li>If you reply within 2 min of the agent finishing, up to 2 min of agent time counts too.</li>
+<li>Typing time is guessed from how long the prompt is, about 48 words a minute, between 5s and 5 min.</li>
+<li>Stopping the agent counts the time since your last action, up to 5 min. A command you run counts up to 5 min, a slash command up to 30s and a rejected tool call up to 1 min.</li>
 <li>Agent time never counts as your time.</li>
-<li>3 or more low info or repeated prompts in a row without testing is dark flow. Only typing time counts for those.</li>
+<li>3 or more short or repeated prompts in a row, each within 15 min of the last and without testing, is dark flow. Only typing time counts for those.</li>
+<li>If a session was resumed or forked, the copied messages only count once.</li>
+<li>The notes say why each row got its time. Hover over a note for the numbers.</li>
 <li>Prompts are only used for word counts and notes. The text isn't saved.</li>
 <li>1/3 rule is agent time divided by 3, which is roughly what reviewers do now with Hackatime AI time.</li>
 </ul>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyze::analyze;
+    use crate::model::{Event, EventKind, Session};
+    use crate::prompt::PromptInfo;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+    }
+    fn prompt(secs: i64, text: &str) -> Event {
+        Event { id: None, t: at(secs), kind: EventKind::Prompt(PromptInfo::analyze(text, 0)) }
+    }
+    fn agent(secs: i64) -> Event {
+        Event { id: None, t: at(secs), kind: EventKind::Agent { tools: vec!["Edit".into()] } }
+    }
+    fn notes(events: Vec<Event>) -> Vec<String> {
+        let r = analyze(&Session { cwd: None, title: None, events }, &[]);
+        r.turns.iter().map(|t| note(t).0).collect()
+    }
+
+    #[test]
+    fn says_how_long_you_took_to_reply() {
+        let n = notes(vec![
+            prompt(0, "add a pause menu with resume and quit buttons"),
+            agent(60),
+            prompt(60 + 9 * 60 + 30, "make the quit button go back to the title screen"),
+        ]);
+        assert_eq!(n[0], "first prompt, just typing time");
+        assert_eq!(n[1], "replied 9m after the agent stopped");
+    }
+
+    #[test]
+    fn says_when_watching_counts() {
+        let n = notes(vec![
+            prompt(0, "add a pause menu with resume and quit buttons"),
+            agent(90),
+            prompt(130, "now make it pause the music too"),
+        ]);
+        assert_eq!(n[1], "replied 40s after the agent stopped + 1m watching");
+    }
+
+    #[test]
+    fn says_why_a_break_is_short() {
+        let n = notes(vec![
+            prompt(0, "make the enemies spawn in waves"),
+            agent(120),
+            prompt(120 + 3600, "continue"),
+            agent(3800),
+            prompt(3800 + 3600, "now add a boss on wave 5 with more health"),
+        ]);
+        assert_eq!(n[1], "short prompt after a break, capped at 2m");
+        assert_eq!(n[2], "back after a break: 2m + typing");
+    }
+
+    #[test]
+    fn says_dark_flow_only_counts_typing() {
+        let mut ev = vec![prompt(0, "build a snake game in the browser")];
+        for (i, text) in ["fix it", "continue", "fix it"].iter().enumerate() {
+            let s = 120 + i as i64 * 180;
+            ev.push(agent(s));
+            ev.push(prompt(s + 60, text));
+        }
+        let n = notes(ev);
+        assert_eq!(n[1], "<span class=\"red\">dark flow</span>: short prompt in a run of 3, typing only");
+    }
+}

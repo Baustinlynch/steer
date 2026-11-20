@@ -267,13 +267,19 @@ export function analyzeSession(session) {
       const prevT = ev[humans[k - 1]].t;
       const seg = segs[k - 1];
       const anchor = seg.last ?? prevT;
-      prev = { gap: Math.max(0, secs(e.t, anchor)), agentPrev: seg.agent, wall: Math.max(0, secs(e.t, prevT)) };
+      prev = {
+        gap: Math.max(0, secs(e.t, anchor)),
+        agentPrev: seg.agent,
+        wall: Math.max(0, secs(e.t, prevT)),
+        fromAgent: seg.last !== null,
+      };
     }
     const tags = [];
-    let breakBefore = false;
     let isLoopy = false;
     let typed = 0;
     let human;
+    let why;
+    let fromAgent = prev !== null && prev.fromAgent;
     let words = 0;
 
     switch (e.kind) {
@@ -293,15 +299,21 @@ export function analyzeSession(session) {
         typed = typingSecs(p);
         if (!prev) {
           human = typed;
+          why = { rule: "first" };
         } else {
+          const { gap, wall } = prev;
           const cap = p.generic ? LOW_INFO_CAP : tested ? TESTED_CAP : REVIEW_CAP;
-          if (prev.gap > cap) {
-            breakBefore = true;
+          if (gap > cap) {
             const back = tested ? BREAK_BACK_TESTED : BREAK_BACK;
             human = Math.min(typed + back, Math.max(cap, typed));
+            why = { rule: "break", gap, cap, back };
           } else {
-            const watch = prev.gap <= WATCH_WINDOW ? Math.min(prev.agentPrev, WATCH_WINDOW) : 0;
-            human = Math.min(Math.max(prev.gap + watch, typed), Math.max(prev.wall, typed));
+            const watch = gap <= WATCH_WINDOW ? Math.min(prev.agentPrev, WATCH_WINDOW) : 0;
+            const reply = gap + watch;
+            human = Math.min(Math.max(reply, typed), Math.max(wall, typed));
+            if (human === typed && typed !== reply) why = { rule: "typing", gap, watch };
+            else if (human < reply) why = { rule: "wall", wall };
+            else why = { rule: "reply", gap, watch, cap };
           }
         }
         isLoopy = (p.generic || repeat) && !tested;
@@ -311,17 +323,19 @@ export function analyzeSession(session) {
         break;
       }
       case "interrupt":
-        human = Math.max(prev ? Math.min(prev.wall, 300) : 10, 5);
+        // Measured from your last action, whatever the agent did since.
+        fromAgent = false;
+        [human, why] = clamped(prev ? prev.wall : null, 10, 5, 300);
         break;
       case "shell":
         ranCommand = true;
-        human = Math.max(prev ? Math.min(prev.gap, 300) : 10, 10);
+        [human, why] = clamped(prev ? prev.gap : null, 10, 10, 300);
         break;
       case "command":
-        human = Math.max(prev ? Math.min(prev.gap, 30) : 5, 5);
+        [human, why] = clamped(prev ? prev.gap : null, 5, 5, 30);
         break;
       case "rejected":
-        human = Math.max(prev ? Math.min(prev.gap, 60) : 10, 10);
+        [human, why] = clamped(prev ? prev.gap : null, 10, 10, 60);
         break;
     }
 
@@ -335,7 +349,11 @@ export function analyzeSession(session) {
       agent: segs[k].agent,
       tools: segs[k].tools,
       darkFlow: false,
-      breakBefore,
+      // Which rule set `human`, for the notes. Doesn't change any counting.
+      why,
+      fromAgent,
+      typed,
+      run: 0,
     });
     loopy.push(isLoopy);
     typing.push(typed);
@@ -343,6 +361,13 @@ export function analyzeSession(session) {
 
   markDarkFlow(turns, loopy, typing);
   return { title: session.title, start, turns };
+}
+
+// Time for actions other than prompts: `since` kept between min and max, or a flat
+// `first` if it's the first thing in the session.
+function clamped(since, first, min, max) {
+  if (since === null) return [Math.max(first, min), { rule: "first" }];
+  return [Math.max(Math.min(since, max), min), { rule: "clamped", secs: since, min, max }];
 }
 
 function markDarkFlow(turns, loopy, typing) {
@@ -365,6 +390,7 @@ function markDarkFlow(turns, loopy, typing) {
         t.flagged = t.human - keep;
         t.human = keep;
         t.darkFlow = true;
+        t.run = b - a + 1;
       }
     }
     a = b + 1;
@@ -516,27 +542,135 @@ function renderSession(s, hideTitles) {
     const d = new Date(t.t);
     const when = dayKey(d) === startDay ? hm(d) : fullDate(d);
     const action = t.kind === "prompt" ? `Prompt (${plural(t.words, "word")})` : ACTIONS[t.kind];
-    const notes = [];
-    if (t.breakBefore) notes.push("after break");
-    notes.push(...t.tags);
-    let noteText = notes.join(", ");
-    if (t.darkFlow) noteText += (noteText ? ", " : "") + '<span class="red">dark flow</span>';
+    const note = turnNote(t);
     const you = t.darkFlow && t.flagged > 0 ? `${fmtDur(t.human)} (was ${fmtDur(t.human + t.flagged)})` : fmtDur(t.human);
     const did = TOOL_GROUPS.map((g, i) => [g, t.tools[i]]).filter(([, n]) => n > 0).map(([g, n]) => plural(n, g));
-    h += `<tr${t.darkFlow ? ' class="flow"' : ""}><td>${when}</td><td>${action}</td><td>${noteText}</td><td class="r">${you}</td><td class="r">${t.agent > 0 ? fmtDur(t.agent) : ""}</td><td>${did.join(", ")}</td></tr>\n`;
+    h += `<tr${t.darkFlow ? ' class="flow"' : ""}><td>${when}</td><td>${action}</td><td title="${esc(note.long)}">${note.short}</td><td class="r">${you}</td><td class="r">${t.agent > 0 ? fmtDur(t.agent) : ""}</td><td>${did.join(", ")}</td></tr>\n`;
   }
   return h + "</table></div>\n</details>\n";
+}
+
+// Seconds for the hover text: "40s", "9m 12s", "1h 05m".
+function exact(n) {
+  n = Math.max(0, n);
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const s = n % 60;
+  if (h > 0) return `${h}h ${pad(m)}m`;
+  if (m === 0) return `${s}s`;
+  return s === 0 ? `${m}m` : `${m}m ${s}s`;
+}
+
+// Like fmtDur, but 0 is "0s".
+const ago = (n) => (n <= 0 ? "0s" : fmtDur(n));
+
+const TAG_WORDS = {
+  screenshot: "has a screenshot",
+  "reported a result": "says what happened",
+  "ran a command first": "you ran a command first",
+  specific: "names files or code",
+  "low info": 'short, like "continue"',
+  repeat: "almost the same as your last prompt",
+};
+
+// How the prompt shows you tested something, if it does. Same as `tested` above.
+function testedHow(t) {
+  if (t.tags.includes("screenshot")) return "you sent a screenshot";
+  if (t.tags.includes("reported a result")) return "you said what happened";
+  if (t.tags.includes("ran a command first")) return "you ran a command first";
+  return null;
+}
+
+/**
+ * Why a turn got the time it did: `short` for the notes column (HTML), `long` for
+ * hovering over it (plain text). src/report.rs has the same words in note().
+ */
+export function turnNote(t) {
+  // Time before dark flow cut it down.
+  const base = t.human + t.flagged;
+  const since = t.fromAgent ? "after the agent stopped" : "after your last action";
+  const shortPrompt = t.tags.includes("low info");
+  const tested = testedHow(t);
+  const capWhy = (cap) => {
+    if (cap === TESTED_CAP && tested) return ` it's ${exact(cap)} because ${tested}.`;
+    if (cap === LOW_INFO_CAP) return ` it's ${exact(cap)} because it's a short prompt like "continue".`;
+    return "";
+  };
+  const w = t.why;
+  let short;
+  let long;
+
+  if (w.rule === "first" && t.kind === "prompt") {
+    short = "first prompt, just typing time";
+    long = `nothing before it to measure from, so only typing time counts (${exact(t.typed)}).`;
+  } else if (w.rule === "first") {
+    short = `first action, counts ${ago(base)}`;
+    long = `nothing before it to measure from, so it gets a flat ${exact(base)}.`;
+  } else if (w.rule === "break") {
+    const came = `your prompt came ${exact(w.gap)} ${since}`;
+    if (base === t.typed + w.back) {
+      short = tested ? `back after a break, tested: ${ago(w.back)} + typing` : `back after a break: ${ago(w.back)} + typing`;
+      long = `${came}, over the ${exact(w.cap)} max, so it counts as a break. we can't tell when you came back, so ${exact(w.back)} to catch up plus typing (${exact(t.typed)}) counts.`;
+      if (tested) long += ` the max is ${exact(w.cap)} and catch-up is ${exact(w.back)} because ${tested}.`;
+    } else if (base > t.typed) {
+      short = shortPrompt ? `short prompt after a break, capped at ${ago(w.cap)}` : `back after a break, capped at ${ago(w.cap)}`;
+      long = `${came}, over the ${exact(w.cap)} max.${capWhy(w.cap)}`;
+    } else {
+      short = "typing time, longer than the max";
+      long = `${came}, over the ${exact(w.cap)} max, but typing it takes about ${exact(t.typed)}.`;
+    }
+  } else if (w.rule === "reply" && w.watch > 0) {
+    short = `replied ${ago(w.gap)} ${since} + ${ago(w.watch)} watching`;
+    long = `you replied ${exact(w.gap)} ${since}. that's within ${exact(WATCH_WINDOW)}, so you were probably watching it work, and ${exact(w.watch)} of its run time counts too.`;
+  } else if (w.rule === "reply") {
+    short = tested && w.gap > REVIEW_CAP ? `tested, replied ${ago(w.gap)} ${since}` : `replied ${ago(w.gap)} ${since}`;
+    long = t.fromAgent
+      ? `the ${exact(w.gap)} between the agent stopping and your prompt counts, up to ${exact(w.cap)}.`
+      : `the agent didn't do anything after your last action, so the ${exact(w.gap)} since then counts, up to ${exact(w.cap)}.`;
+    long += capWhy(w.cap);
+  } else if (w.rule === "typing") {
+    short = "typing time, longer than the wait";
+    long = `you replied ${exact(w.gap)} ${since}${w.watch > 0 ? ` (+${exact(w.watch)} watching)` : ""}, but typing it takes about ${exact(t.typed)}, so typing time counts.`;
+  } else if (w.rule === "wall") {
+    short = `${ago(w.wall)} since your last action`;
+    long = "it can't count more than the time since your last action.";
+  } else {
+    const asked = t.kind === "rejected" && t.fromAgent;
+    const after = asked ? "after the agent asked" : since;
+    const from = asked ? "since the agent asked" : t.fromAgent ? "since the agent stopped" : "since your last action";
+    if (w.secs > w.max) short = `${exact(w.secs)} ${after}, capped at ${ago(w.max)}`;
+    else if (w.secs < w.min) short = `under ${ago(w.min)}, counts as ${ago(w.min)}`;
+    else short = `${ago(w.secs)} ${after}`;
+    const range = `${exact(w.min)} to ${exact(w.max)}`;
+    long = {
+      interrupt: `stopping the agent means you were watching it, so the time since your last action counts, ${range}.`,
+      shell: `you ran a command yourself, so the time ${from} counts, ${range}. your next prompt counts as tested.`,
+      command: `slash commands count the time ${from}, ${range}.`,
+      rejected: `you read what the agent wanted to do and said no. the time ${from} counts, ${range}.`,
+    }[t.kind] ?? `the time ${from} counts, ${range}.`;
+  }
+
+  if (t.darkFlow) {
+    const was = t.flagged > 0 ? ` it would have been ${exact(base)}: ${short}.` : "";
+    short = `<span class="red">dark flow</span>: ${shortPrompt ? "short" : "repeat"} prompt in a run of ${t.run}, typing only`;
+    long = `${t.run} short or repeat prompts in a row, each within ${exact(LOOP_GAP)} of the last, and none show testing. that looks like hitting retry, so only typing time counts (${exact(t.typed)}).${was}`;
+  }
+  if (t.kind === "prompt" && t.tags.length > 0) long += `\nprompt: ${t.tags.map((g) => TAG_WORDS[g] ?? g).join(", ")}`;
+  return { short, long };
 }
 
 const HOW = `<h2>How it counts</h2>
 <ul>
 <li>Your time comes from things you do: prompts, stopping the agent, rejecting a tool call, running a command.</li>
-<li>Time between the agent finishing and your next prompt counts, up to 10 min. Up to 20 min if the prompt has a screenshot, describes what happened, or you ran a command first. Up to 2 min for prompts like "continue".</li>
-<li>A longer gap is a break. Then only 2 min plus typing time counts (5 min if you tested something).</li>
+<li>Time between the agent finishing and your next prompt counts, up to 10 min. Up to 20 min if the prompt has a screenshot, describes what happened, or you ran a command first. Up to 2 min for short prompts like "continue" (3 words or less with no file names, numbers or code).</li>
+<li>A longer gap is a break. Then only 2 min plus typing time counts (5 min if you tested something). Short prompts get 2 min at most.</li>
 <li>If you reply within 2 min of the agent finishing, up to 2 min of agent time counts too.</li>
+<li>Typing time is guessed from how long the prompt is, about 48 words a minute, between 5s and 5 min.</li>
+<li>Stopping the agent counts the time since your last action, up to 5 min. A command you run counts up to 5 min, a slash command up to 30s and a rejected tool call up to 1 min.</li>
 <li>Agent time never counts as your time.</li>
-<li>3 or more low info or repeated prompts in a row without testing is dark flow. Only typing time counts for those.</li>
+<li>3 or more short or repeated prompts in a row, each within 15 min of the last and without testing, is dark flow. Only typing time counts for those.</li>
 <li>If a session was resumed or forked, the copied messages only count once.</li>
+<li>The notes say why each row got its time. Hover over a note for the numbers.</li>
 <li>Prompts are only used for word counts and notes. The text isn't saved.</li>
 <li>1/3 rule is agent time divided by 3, which is roughly what reviewers do now with Hackatime AI time.</li>
 </ul>

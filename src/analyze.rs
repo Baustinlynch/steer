@@ -11,21 +11,21 @@ use chrono::{DateTime, Duration, Utc};
 const AGENT_TIMEOUT: i64 = 600;
 /// If you reply within this long after the agent finishes, you were watching it work,
 /// and up to this much of its runtime counts as reading along.
-const WATCH_WINDOW: i64 = 120;
+pub const WATCH_WINDOW: i64 = 120;
 /// Longest gap counted as reviewing before a normal prompt.
-const REVIEW_CAP: i64 = 600;
+pub const REVIEW_CAP: i64 = 600;
 /// Longer cap when the prompt shows you tested something (screenshot, reported result,
 /// or you ran a command first).
-const TESTED_CAP: i64 = 1200;
+pub const TESTED_CAP: i64 = 1200;
 /// Short cap before low-info prompts like "continue".
-const LOW_INFO_CAP: i64 = 120;
+pub const LOW_INFO_CAP: i64 = 120;
 /// After a gap longer than the cap (a break), we can't tell when you came back, so only
 /// a short re-read plus typing counts.
 const BREAK_BACK: i64 = 120;
 /// Same, when the prompt shows you tested something after coming back.
 const BREAK_BACK_TESTED: i64 = 300;
 /// Low-info or repeated prompts closer together than this can form a dark-flow loop.
-const LOOP_GAP: i64 = 900;
+pub const LOOP_GAP: i64 = 900;
 /// How many in a row before it's flagged.
 const LOOP_MIN: usize = 3;
 
@@ -38,6 +38,24 @@ pub enum TurnKind {
     Shell,
     Command,
     Rejected,
+}
+
+/// Which rule set a turn's time, with the numbers it used. Only the report reads this,
+/// to explain each row. It doesn't change any counting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// First action of the session, so there's nothing before it to measure from.
+    First,
+    /// Prompt after a gap longer than its cap: a catch-up time plus typing.
+    Break { gap: i64, cap: i64, back: i64 },
+    /// Prompt within the cap: the gap, plus `watch` of agent time if you replied fast.
+    Reply { gap: i64, watch: i64, cap: i64 },
+    /// Prompt where typing it takes longer than the wait.
+    Typing { gap: i64, watch: i64 },
+    /// Prompt cut down to the time since your last action.
+    Wall { wall: i64 },
+    /// Any other action: `secs` kept between `min` and `max`.
+    Clamped { secs: i64, min: i64, max: i64 },
 }
 
 /// One human action, plus the agent activity that followed it.
@@ -55,7 +73,14 @@ pub struct Turn {
     pub tools: [usize; 7],
     pub commits: usize,
     pub dark_flow: bool,
-    pub break_before: bool,
+    pub why: Why,
+    /// True if the gap in `why` runs from the agent's last step, false if from your
+    /// last action (the agent did nothing in between, or this is a stop).
+    pub from_agent: bool,
+    /// Typing time of the prompt (0 for other actions).
+    pub typed: i64,
+    /// For dark flow: how many prompts were in the run.
+    pub run: usize,
 }
 
 pub struct SessionReport {
@@ -135,7 +160,8 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
 
     for (k, &i) in humans.iter().enumerate() {
         let e = &ev[i];
-        // (gap since the agent last did something, agent runtime before this, time since last human action)
+        // (gap since the agent last did something, agent runtime before this, time since
+        // last human action, whether the agent did anything since then)
         let prev = (k > 0).then(|| {
             let prev_t = ev[humans[k - 1]].t;
             let seg = &segments[k - 1];
@@ -144,15 +170,16 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
                 (e.t - anchor).num_seconds().max(0),
                 seg.agent_secs,
                 (e.t - prev_t).num_seconds().max(0),
+                seg.last_agent.is_some(),
             )
         });
 
         let mut tags = Vec::new();
-        let mut break_before = false;
         let mut is_loopy = false;
         let mut typed = 0;
+        let mut from_agent = prev.is_some_and(|p| p.3);
 
-        let (kind, words, human_secs) = match &e.kind {
+        let (kind, words, human_secs, why) = match &e.kind {
             EventKind::Prompt(p) => {
                 let tested = p.observation || ran_command;
                 let repeat = last_prompt.is_some_and(|lp| p.words >= 3 && p.similarity(lp) >= 0.6);
@@ -175,9 +202,9 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
                 }
 
                 typed = p.typing_secs();
-                let secs = match prev {
-                    None => typed,
-                    Some((gap, agent_prev, wall)) => {
+                let (secs, why) = match prev {
+                    None => (typed, Why::First),
+                    Some((gap, agent_prev, wall, _)) => {
                         let cap = if p.generic {
                             LOW_INFO_CAP
                         } else if tested {
@@ -186,36 +213,46 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
                             REVIEW_CAP
                         };
                         if gap > cap {
-                            break_before = true;
                             let back = if tested { BREAK_BACK_TESTED } else { BREAK_BACK };
-                            (typed + back).min(cap.max(typed))
+                            ((typed + back).min(cap.max(typed)), Why::Break { gap, cap, back })
                         } else {
                             let watch = if gap <= WATCH_WINDOW { agent_prev.min(WATCH_WINDOW) } else { 0 };
-                            (gap + watch).max(typed).min(wall.max(typed))
+                            let reply = gap + watch;
+                            let secs = reply.max(typed).min(wall.max(typed));
+                            let why = if secs == typed && typed != reply {
+                                Why::Typing { gap, watch }
+                            } else if secs < reply {
+                                Why::Wall { wall }
+                            } else {
+                                Why::Reply { gap, watch, cap }
+                            };
+                            (secs, why)
                         }
                     }
                 };
                 is_loopy = (p.generic || repeat) && !tested;
                 last_prompt = Some(p);
                 ran_command = false;
-                (TurnKind::Prompt, p.words, secs)
+                (TurnKind::Prompt, p.words, secs, why)
             }
             EventKind::Interrupt => {
-                let secs = prev.map_or(10, |(_, _, wall)| wall.min(300)).max(5);
-                (TurnKind::Interrupt, 0, secs)
+                // Measured from your last action, whatever the agent did since.
+                from_agent = false;
+                let (secs, why) = clamped(prev.map(|p| p.2), 10, 5, 300);
+                (TurnKind::Interrupt, 0, secs, why)
             }
             EventKind::Shell => {
                 ran_command = true;
-                let secs = prev.map_or(10, |(gap, _, _)| gap.min(300)).max(10);
-                (TurnKind::Shell, 0, secs)
+                let (secs, why) = clamped(prev.map(|p| p.0), 10, 10, 300);
+                (TurnKind::Shell, 0, secs, why)
             }
             EventKind::Command => {
-                let secs = prev.map_or(5, |(gap, _, _)| gap.min(30)).max(5);
-                (TurnKind::Command, 0, secs)
+                let (secs, why) = clamped(prev.map(|p| p.0), 5, 5, 30);
+                (TurnKind::Command, 0, secs, why)
             }
             EventKind::Rejected => {
-                let secs = prev.map_or(10, |(gap, _, _)| gap.min(60)).max(10);
-                (TurnKind::Rejected, 0, secs)
+                let (secs, why) = clamped(prev.map(|p| p.0), 10, 10, 60);
+                (TurnKind::Rejected, 0, secs, why)
             }
             EventKind::Agent { .. } => unreachable!("only human events become turns"),
         };
@@ -234,7 +271,10 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
             tools: segments[k].tools,
             commits: commits_in,
             dark_flow: false,
-            break_before,
+            why,
+            from_agent,
+            typed,
+            run: 0,
         });
         loopy.push(is_loopy);
         typing.push(typed);
@@ -242,6 +282,15 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
 
     mark_dark_flow(&mut turns, &loopy, &typing);
     SessionReport { title: session.title.clone(), start, turns }
+}
+
+/// Time for actions other than prompts: `since` kept between `min` and `max`, or a flat
+/// `first` if it's the first thing in the session.
+fn clamped(since: Option<i64>, first: i64, min: i64, max: i64) -> (i64, Why) {
+    match since {
+        None => (first.max(min), Why::First),
+        Some(s) => (s.min(max).max(min), Why::Clamped { secs: s, min, max }),
+    }
 }
 
 /// 3+ low-info or near-repeat prompts in a row, close together, with no testing in
@@ -268,6 +317,7 @@ fn mark_dark_flow(turns: &mut [Turn], loopy: &[bool], typing: &[i64]) {
                 t.flagged_secs = t.human_secs - keep;
                 t.human_secs = keep;
                 t.dark_flow = true;
+                t.run = b - a + 1;
             }
         }
         a = b + 1;
@@ -314,7 +364,7 @@ mod tests {
             agent(at(2, 0)),
             prompt(at(180, 0), "now add a boss on wave 5 with more health"),
         ]);
-        assert!(r.turns[1].break_before);
+        assert!(matches!(r.turns[1].why, Why::Break { .. }));
         // Not the 3 hours, and not the full 10-minute cap either: a re-read plus typing.
         assert!(r.human_secs() <= BREAK_BACK + 60, "got {}", r.human_secs());
     }
