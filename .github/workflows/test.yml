@@ -17,3 +17,6 @@ jobs:
       - run: cargo test --locked
       - run: node --check server/server.mjs && node --check web/steer.js && node --check web/app.js
       - run: node tests/login.mjs
+      # installs, sends an event, updates and uninstalls a real build on each system
+      - run: cargo build --release --locked
+      - run: node tests/install.mjs

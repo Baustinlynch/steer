@@ -15,11 +15,14 @@
 
 <h2>Live tracking</h2>
 <p>Install steer once and it tracks Claude Code, Codex, OpenCode, Copilot and Cursor while you work. Your page at steer.duck.hackclub.app/u/your-name updates as you go.</p>
-<p>Mac and Linux:</p>
-<pre><code>curl -fsSL https://steer.duck.hackclub.app/install.sh | sh</code></pre>
-<p>Windows (PowerShell):</p>
-<pre><code>irm https://steer.duck.hackclub.app/install.ps1 | iex</code></pre>
-<p class="muted">Prompt text never leaves your computer, only counts like how many words it had and whether it said what happened when you tested something. The code is at <a href="https://github.com/EwoudVV/steer">github.com/EwoudVV/steer</a>. To undo everything: <code>~/.steer/bin/steer setup --remove</code></p>
+<p>Paste this into a terminal. It tells you what it's going to change and asks before doing anything.</p>
+<div id="install">
+<p data-os="unix">Mac and Linux (Terminal):</p>
+<div class="cmd" data-os="unix"><pre><code>curl -fsSL https://steer.duck.hackclub.app/install.sh | sh</code></pre></div>
+<p data-os="windows">Windows (PowerShell):</p>
+<div class="cmd" data-os="windows"><pre><code>irm https://steer.duck.hackclub.app/install.ps1 | iex</code></pre></div>
+</div>
+<p class="muted">Prompt text never leaves your computer, only counts like how many words it had and whether it said what happened when you tested something. The code is at <a href="https://github.com/EwoudVV/steer">github.com/EwoudVV/steer</a>. If something seems off, run <code>steer doctor</code>. To undo everything: <code>steer uninstall</code></p>
 
 <h2>Or check your old Claude Code logs</h2>
 <p>Claude Code keeps them in a hidden folder:</p>

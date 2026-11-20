@@ -18,12 +18,14 @@ windows (powershell):
 irm https://steer.duck.hackclub.app/install.ps1 | iex
 ```
 
-it asks for a name, then hooks into your tools. your page is at `https://steer.duck.hackclub.app/u/NAME` and updates while you work.
+it tells you what it found and what it's going to change, and asks first. then you sign in with your hack club account and it hooks into your tools. your page is at `https://steer.duck.hackclub.app/u/NAME` and updates while you work.
+
+you can also download steer from the [releases page](https://github.com/EwoudVV/steer/releases) and run it. the first time, it does the same setup.
 
 to undo everything:
 
 ```bash
-~/.steer/bin/steer setup --remove
+steer uninstall
 ```
 
 ## how it works
@@ -48,10 +50,17 @@ the bottom of every report explains it, and the code is in `src/analyze.rs` (and
 ## other commands
 
 ```bash
-steer status                       # whats set up and whats waiting to send
+steer                              # sets it all up the first time, after that shows the status
+steer doctor                       # checks everything and says how to fix what's broken
+steer update                       # gets the newest version now
+steer uninstall                    # takes steer out of your tools and deletes ~/.steer
 steer watch --dry-run --days 30    # what the watcher would send, as counts only
 steer report --days 30             # html report from your old claude code logs
 ```
+
+## updates
+
+the watcher checks github for a new version once a day and swaps it in by itself. that check only asks github which version is newest, nothing about you gets sent. to turn it off, make a file at `~/.steer/no-update` (or set `STEER_NO_UPDATE`) and run `steer update` when you want to.
 
 the website also has a drop-a-folder version of the report that runs in your browser.
 

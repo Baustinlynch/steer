@@ -12,11 +12,14 @@ Invoke-WebRequest -UseBasicParsing "https://github.com/EwoudVV/steer/releases/la
 Get-Process steer -ErrorAction SilentlyContinue | Stop-Process -Force
 Move-Item -Force "$exe.new" $exe
 
-if (-not (Test-Path (Join-Path $HOME ".steer\config.json"))) {
-  Write-Host "sign in with your hack club account:"
-  & $exe login
-  if ($LASTEXITCODE -ne 0) { exit 1 }
+# so you can type steer in any new terminal
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (-not (($userPath -split ";") -contains $bin)) {
+  [Environment]::SetEnvironmentVariable("Path", ((@($userPath, $bin) | Where-Object { $_ }) -join ";"), "User")
 }
+if (-not (($env:Path -split ";") -contains $bin)) { $env:Path = "$env:Path;$bin" }
+Write-Host ""
 
-& $exe setup
-Write-Host "done. check on it anytime with: ~\.steer\bin\steer status"
+# steer install explains what it does and asks first
+& $exe install
+exit $LASTEXITCODE

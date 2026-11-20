@@ -4,6 +4,7 @@ mod copilot;
 mod claude;
 mod git;
 mod live;
+mod manage;
 mod model;
 mod opencode;
 mod prompt;
@@ -22,10 +23,8 @@ struct Args {
     hide_titles: bool,
 }
 
-const HELP: &str = "steer: shows how much time you spent working with your ai agent
-
-report from your old claude code logs (runs on your computer, nothing gets uploaded):
-  steer [report] [--days N | --all] [--out FILE] [--hide-titles] [--root DIR]
+const HELP: &str = "report from your old claude code logs (runs on your computer, nothing gets uploaded):
+  steer report [--days N | --all] [--out FILE] [--hide-titles] [--root DIR]
 
   --days N        only sessions active in the last N days (default 30)
   --all           every session
@@ -35,7 +34,11 @@ report from your old claude code logs (runs on your computer, nothing gets uploa
 ";
 
 fn help() -> String {
-    format!("{HELP}\n{}", live::HELP)
+    format!(
+        "steer {}: tracks the time you spend working with ai agents\n\n{}\n\n{HELP}",
+        manage::VERSION,
+        live::HELP
+    )
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -64,7 +67,14 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
+        None => std::process::exit(manage::bare()),
         Some("hook") => return live::hook(&argv[1..]),
+        Some("install") => std::process::exit(manage::finish(manage::install(&argv))),
+        Some("update") => std::process::exit(manage::finish(manage::update_command())),
+        Some("doctor") => std::process::exit(manage::doctor()),
+        Some("uninstall") => std::process::exit(manage::finish(manage::uninstall(&argv))),
+        Some("version" | "--version" | "-V") => return println!("steer {}", manage::VERSION),
+        Some("help" | "--help" | "-h") => return println!("{}", help()),
         Some("signup" | "login" | "setup" | "status" | "flush") => std::process::exit(live::command(&argv)),
         Some("watch") => {
             if argv.iter().any(|a| a == "--dry-run") {

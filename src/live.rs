@@ -33,9 +33,9 @@ pub(crate) fn dir() -> PathBuf {
 // ---------- config ----------
 
 pub(crate) struct Config {
-    server: String,
-    key: String,
-    name: Option<String>,
+    pub(crate) server: String,
+    pub(crate) key: String,
+    pub(crate) name: Option<String>,
 }
 
 pub(crate) fn load_config() -> Option<Config> {
@@ -62,7 +62,7 @@ fn save_config(c: &Config) -> Result<(), String> {
 
 // ---------- talking to the server ----------
 
-fn post(server: &str, path: &str, key: Option<&str>, body: &Value) -> Result<Value, String> {
+pub(crate) fn post(server: &str, path: &str, key: Option<&str>, body: &Value) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
     let mut req = agent
         .post(&format!("{}{}", server.trim_end_matches('/'), path))
@@ -368,6 +368,7 @@ fn send_all(config: &Config) -> Result<usize, String> {
             for chunk in events.chunks(BATCH) {
                 post(&config.server, "/api/events", Some(&config.key), &json!({ "events": chunk }))?;
                 sent += chunk.len();
+                let _ = fs::write(dir().join("last-sent"), Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
             }
             let _ = fs::remove_file(&file);
         }
@@ -375,7 +376,7 @@ fn send_all(config: &Config) -> Result<usize, String> {
     }
 }
 
-fn queued() -> usize {
+pub(crate) fn queued() -> usize {
     fs::read_dir(dir())
         .map(|entries| {
             entries
@@ -392,9 +393,93 @@ fn queued() -> usize {
         .unwrap_or(0)
 }
 
+// ---------- the installed copy ----------
+
+/// Where steer lives once installed: ~/.steer/bin/steer. Hooks and the watcher run
+/// this copy, so they keep working if the one you downloaded gets moved or deleted.
+pub(crate) fn bin_path() -> PathBuf {
+    dir().join("bin").join(if cfg!(windows) { "steer.exe" } else { "steer" })
+}
+
+/// Copies the running steer to ~/.steer/bin, unless it's already that copy.
+pub(crate) fn install_bin() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let target = bin_path();
+    let same = match (fs::canonicalize(&exe), fs::canonicalize(&target)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if !same {
+        let bin = target.parent().unwrap();
+        fs::create_dir_all(bin).map_err(|e| e.to_string())?;
+        let fresh = bin.join(format!("steer-new-{}{}", std::process::id(), std::env::consts::EXE_SUFFIX));
+        fs::copy(&exe, &fresh).map_err(|e| format!("couldn't copy steer to {}: {e}", bin.display()))?;
+        swap_in(&fresh, &target)?;
+    }
+    Ok(target)
+}
+
+/// Puts `fresh` where `target` is. A rename is all or nothing, so a hook that runs at
+/// the same moment never sees a half-written file. Windows won't replace an exe that's
+/// running (like the watcher), but it does let it be renamed, so the old one is moved
+/// out of the way first and deleted later by `clean_old_bins`.
+pub(crate) fn swap_in(fresh: &Path, target: &Path) -> Result<(), String> {
+    if fs::rename(fresh, target).is_ok() {
+        return Ok(());
+    }
+    let old = target.with_file_name(format!("steer-old-{}.exe", new_id()));
+    let _ = fs::rename(target, &old);
+    fs::rename(fresh, target).map_err(|e| {
+        let _ = fs::remove_file(fresh);
+        format!("couldn't put steer in {}: {e}", target.display())
+    })
+}
+
+/// Deletes copies left behind by `swap_in` and by updates that didn't finish.
+pub(crate) fn clean_old_bins() {
+    let Ok(entries) = fs::read_dir(dir().join("bin")) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let leftover = name.starts_with("steer-old-") || name.starts_with("steer-new-") || name.ends_with(".new");
+        if leftover && !name.contains(&format!("-{}", std::process::id())) {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Hooks for Claude Code and Cursor, plus the watcher at login (or with `remove`, all
+/// of that taken out again).
+pub(crate) fn setup_all(remove: bool, watch: bool) -> Result<String, String> {
+    let mut msg = setup(&claude_settings(), remove)?;
+    if let Some(c) = setup_cursor(&cursor_dir().join("hooks.json"), remove)? {
+        msg += &format!("\n{c}");
+    }
+    if watch {
+        msg += &format!("\n{}", crate::watch::autostart(remove)?);
+    }
+    Ok(msg)
+}
+
+/// When events last went through to the server, written by `flush`.
+pub(crate) fn last_sent() -> Option<DateTime<Utc>> {
+    let text = fs::read_to_string(dir().join("last-sent")).ok()?;
+    DateTime::parse_from_rfc3339(text.trim()).ok().map(|t| t.with_timezone(&Utc))
+}
+
+/// "4m ago", "2h ago", "3 days ago".
+pub(crate) fn ago(t: DateTime<Utc>) -> String {
+    let s = (Utc::now() - t).num_seconds().max(0);
+    match s {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", s / 60),
+        3600..=86_399 => format!("{}h ago", s / 3600),
+        _ => format!("{} days ago", s / 86_400),
+    }
+}
+
 // ---------- Claude Code settings ----------
 
-fn claude_settings() -> PathBuf {
+pub(crate) fn claude_settings() -> PathBuf {
     home().join(".claude").join("settings.json")
 }
 
@@ -418,6 +503,9 @@ fn setup(settings: &Path, remove: bool) -> Result<String, String> {
     } else {
         None
     };
+    if remove && original.is_none() {
+        return Ok(format!("no steer hooks in {}", settings.display()));
+    }
     let mut root: Value = match &original {
         Some(text) if !text.trim().is_empty() => serde_json::from_str(text)
             .map_err(|e| format!("{} isn't valid JSON ({e}), so it wasn't changed", settings.display()))?,
@@ -425,23 +513,7 @@ fn setup(settings: &Path, remove: bool) -> Result<String, String> {
     };
     let obj = root.as_object_mut().ok_or("settings.json isn't a JSON object, so it wasn't changed")?;
 
-    let command = if remove {
-        String::new()
-    } else {
-        // Copy the binary somewhere stable so the hooks keep working if this one moves.
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let bin = dir().join("bin");
-        fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
-        let target = bin.join(if cfg!(windows) { "steer.exe" } else { "steer" });
-        if exe != target {
-            // Copy next to it, then swap it in, so a hook that's running right now never
-            // sees a half-written file.
-            let fresh = bin.join(format!("steer-{}.new", std::process::id()));
-            fs::copy(&exe, &fresh).map_err(|e| format!("couldn't copy steer to {}: {e}", bin.display()))?;
-            fs::rename(&fresh, &target).map_err(|e| format!("couldn't put steer in {}: {e}", target.display()))?;
-        }
-        format!("\"{}\" hook", target.display())
-    };
+    let command = if remove { String::new() } else { format!("\"{}\" hook", install_bin()?.display()) };
 
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().ok_or("\"hooks\" in settings.json isn't an object, so it wasn't changed")?;
@@ -484,7 +556,7 @@ fn setup(settings: &Path, remove: bool) -> Result<String, String> {
     })
 }
 
-fn hooks_installed(settings: &Path) -> bool {
+pub(crate) fn hooks_installed(settings: &Path) -> bool {
     fs::read_to_string(settings)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -501,7 +573,7 @@ fn hooks_installed(settings: &Path) -> bool {
 
 const CURSOR_HOOKS: [(&str, &str); 3] = [("beforeSubmitPrompt", "prompt"), ("postToolUse", "tool"), ("stop", "stop")];
 
-fn cursor_dir() -> PathBuf {
+pub(crate) fn cursor_dir() -> PathBuf {
     home().join(".cursor")
 }
 
@@ -528,7 +600,7 @@ fn setup_cursor(file: &Path, remove: bool) -> Result<Option<String>, String> {
     obj.entry("version").or_insert(1.into());
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().ok_or("\"hooks\" in ~/.cursor/hooks.json isn't an object")?;
-    let bin = dir().join("bin").join(if cfg!(windows) { "steer.exe" } else { "steer" });
+    let bin = bin_path();
     for (event, which) in CURSOR_HOOKS {
         let list = hooks.entry(event).or_insert_with(|| json!([]));
         let Some(list) = list.as_array_mut() else { continue };
@@ -552,7 +624,7 @@ fn setup_cursor(file: &Path, remove: bool) -> Result<Option<String>, String> {
     }))
 }
 
-fn cursor_hooks_installed() -> bool {
+pub(crate) fn cursor_hooks_installed() -> bool {
     fs::read_to_string(cursor_dir().join("hooks.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -566,15 +638,24 @@ fn cursor_hooks_installed() -> bool {
 // ---------- commands ----------
 
 pub const HELP: &str = "live tracking:
+  steer                              set it all up, or if it already is, show status
+  steer install [--yes]              sign in, hook into your tools, start the watcher
+  steer status                       show what's set up and what's waiting to send
+  steer doctor                       check everything and say how to fix what's broken
+  steer update                       get the newest version now (it also checks daily)
+  steer uninstall [--yes]            take steer out of your tools and delete ~/.steer
+  steer version                      show which version this is
+
   steer login                        sign in with your hack club account
   steer login KEY [--server URL]     use a key you already have
   steer signup NAME --server URL     make an account on a server without hack club login
-  steer setup                        hook into Claude Code and Cursor, and start the
+  steer setup [--no-watch]           hook into Claude Code and Cursor, and start the
                                      watcher for Codex, OpenCode and Copilot at login
   steer setup --remove               undo all of that
-  steer status                       show what's set up and what's waiting to send
   steer watch --dry-run [--days N]   show what the watcher would send, as counts
-  steer flush                        send waiting events now";
+  steer flush                        send waiting events now
+
+daily update checks are off if ~/.steer/no-update exists or STEER_NO_UPDATE is set";
 
 fn flag_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -598,22 +679,21 @@ fn positional(args: &[String]) -> Option<&String> {
 pub fn command(args: &[String]) -> i32 {
     let result = match args[0].as_str() {
         "signup" => signup(args),
-        "login" => login(args),
+        "login" => login(args).map(|msg| {
+            if hooks_installed(&claude_settings()) {
+                msg
+            } else {
+                msg + "\nnext: steer setup"
+            }
+        }),
         "setup" => {
             let custom = flag_value(args, "--settings").map(PathBuf::from);
             let remove = args.iter().any(|a| a == "--remove");
-            let settings = custom.clone().unwrap_or_else(claude_settings);
-            setup(&settings, remove).and_then(|hooks| {
-                // A custom settings file means a test run, so leave login items alone.
-                if custom.is_some() || args.iter().any(|a| a == "--no-watch") {
-                    return Ok(hooks);
-                }
-                let mut msg = hooks;
-                if let Some(c) = setup_cursor(&cursor_dir().join("hooks.json"), remove)? {
-                    msg += &format!("\n{c}");
-                }
-                crate::watch::autostart(remove).map(|w| format!("{msg}\n{w}"))
-            })
+            match custom {
+                // A custom settings file means a test run, so only that file is touched.
+                Some(settings) => setup(&settings, remove),
+                None => setup_all(remove, !args.iter().any(|a| a == "--no-watch")),
+            }
         }
         "status" => Ok(status()),
         "flush" => flush().map(|n| format!("sent {n} events")),
@@ -645,14 +725,14 @@ fn signup(args: &[String]) -> Result<String, String> {
     ))
 }
 
-fn login(args: &[String]) -> Result<String, String> {
+pub(crate) fn login(args: &[String]) -> Result<String, String> {
     let server = flag_value(args, "--server")
         .or_else(|| load_config().map(|c| c.server))
         .unwrap_or_else(|| DEFAULT_SERVER.into());
     if let Some(key) = positional(args) {
         post(&server, "/api/events", Some(key), &json!({ "events": [] }))?;
         save_config(&Config { server, key: key.clone(), name: None })?;
-        return Ok("key works, saved. next: steer setup".into());
+        return Ok("key works, saved".into());
     }
 
     // Sign in with Hack Club in the browser. If this computer already has a key, it's
@@ -677,10 +757,7 @@ fn login(args: &[String]) -> Result<String, String> {
                 let name = v.get("name").and_then(Value::as_str).map(str::to_owned);
                 save_config(&Config { server: server.clone(), key: key.into(), name: name.clone() })?;
                 let name = name.unwrap_or_default();
-                return Ok(format!(
-                    "signed in as {name}\nyour page: {}/u/{name}\nnext: steer setup (skip if you already did)",
-                    server.trim_end_matches('/')
-                ));
+                return Ok(format!("signed in as {name}\nyour page: {}/u/{name}", server.trim_end_matches('/')));
             }
             Some("expired") => return Err("the login link expired, run steer login again".into()),
             _ => {}
@@ -689,7 +766,7 @@ fn login(args: &[String]) -> Result<String, String> {
     Err("timed out waiting for the browser, run steer login again".into())
 }
 
-fn get(server: &str, path: &str) -> Result<Value, String> {
+pub(crate) fn get(server: &str, path: &str) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
     match agent.get(&format!("{}{}", server.trim_end_matches('/'), path)).call() {
         Ok(resp) => serde_json::from_str(&resp.into_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
@@ -702,7 +779,7 @@ fn get(server: &str, path: &str) -> Result<Value, String> {
     }
 }
 
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     if std::env::var_os("STEER_NO_BROWSER").is_some() {
         return;
     }
@@ -722,7 +799,7 @@ fn open_browser(url: &str) {
     let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
-fn status() -> String {
+pub(crate) fn status() -> String {
     let settings = claude_settings();
     let mut out = String::new();
     match load_config() {
@@ -754,6 +831,9 @@ fn status() -> String {
         if crate::watch::running() { "running" } else { "not running, run steer setup" }
     );
     out += &format!("waiting to send: {} events", queued());
+    if let Some(t) = last_sent() {
+        out += &format!("\nlast sent: {}", ago(t));
+    }
     out
 }
 

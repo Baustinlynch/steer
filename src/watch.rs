@@ -70,8 +70,27 @@ pub fn run() -> i32 {
     let mut skip_codex = !state.contains_key("codex");
     let mut skip_copilot = !state.contains_key("copilot");
     let mut sent = HashSet::new();
+    // Only the installed copy updates itself, never a build someone is working on.
+    let installed = std::env::current_exe().ok().and_then(|e| fs::canonicalize(e).ok()) == fs::canonicalize(live::bin_path()).ok();
 
     loop {
+        if installed && crate::manage::update_due() {
+            match crate::manage::update() {
+                Ok(Some(v)) => {
+                    eprintln!("steer: updated to {v}, restarting the watcher");
+                    let _ = fs::remove_file(lock_path());
+                    if cfg!(windows) {
+                        spawn_watcher();
+                        return 0;
+                    }
+                    // launchd and systemd start it again after a failed exit, now
+                    // running the new version.
+                    return 1;
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("steer: update check failed: {e}"),
+            }
+        }
         let _ = fs::write(lock_path(), std::process::id().to_string());
         let mut events = Vec::new();
 
@@ -147,11 +166,61 @@ fn summary(tool: &str, events: Vec<&Value>) -> String {
 // ---------- starting at login ----------
 
 fn bin() -> PathBuf {
-    dir().join("bin").join(if cfg!(windows) { "steer.exe" } else { "steer" })
+    live::bin_path()
+}
+
+fn spawn_watcher() {
+    let mut start = Command::new(bin());
+    start.arg("watch").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // A hidden console of its own. Fully detached would make the console programs
+        // it runs (tasklist, reg) pop up windows.
+        start.creation_flags(0x0800_0000);
+    }
+    let _ = start.spawn();
+}
+
+/// Stops the watcher that's running now, if there is one. Returns whether there was.
+fn stop_running() -> bool {
+    if !another_watcher_alive() {
+        return false;
+    }
+    let Ok(pid) = fs::read_to_string(lock_path()) else { return false };
+    let pid = pid.trim();
+    if cfg!(windows) {
+        let _ = Command::new("taskkill").args(["/PID", pid, "/F"]).output();
+    } else {
+        let _ = Command::new("kill").arg(pid).output();
+    }
+    let _ = fs::remove_file(lock_path());
+    true
+}
+
+/// After `steer update`: restarts the watcher so it runs the new version.
+pub fn restart() {
+    if cfg!(target_os = "macos") {
+        if live::home().join("Library").join("LaunchAgents").join(format!("{LABEL}.plist")).exists() {
+            if let Ok(uid) = Command::new("id").arg("-u").output() {
+                let job = format!("gui/{}/{LABEL}", String::from_utf8_lossy(&uid.stdout).trim());
+                let _ = Command::new("launchctl").args(["kickstart", "-k", &job]).output();
+            }
+        }
+    } else if cfg!(target_os = "linux") {
+        let _ = Command::new("systemctl").args(["--user", "try-restart", "steer-watch.service"]).output();
+    } else if stop_running() {
+        spawn_watcher();
+    }
 }
 
 /// Makes `steer watch` start at login and starts it now (or with `remove`, undoes that).
 pub fn autostart(remove: bool) -> Result<String, String> {
+    // launchd, systemd and the registry aren't per home folder, so tests that point HOME
+    // somewhere else set this to keep their hands off the real login items.
+    if std::env::var_os("STEER_SANDBOX").is_some() {
+        return Ok("left login items alone (STEER_SANDBOX is set)".into());
+    }
     if cfg!(target_os = "macos") {
         let plist = live::home().join("Library").join("LaunchAgents").join(format!("{LABEL}.plist"));
         let uid = Command::new("id").arg("-u").output().map_err(|e| e.to_string())?;
@@ -209,23 +278,18 @@ pub fn autostart(remove: bool) -> Result<String, String> {
     } else if cfg!(windows) {
         // Not tried on a real Windows machine yet.
         let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        // Stop the one that's running, so it's either gone or replaced by this version.
+        stop_running();
         if remove {
             let _ = Command::new("reg").args(["delete", key, "/v", "steer-watch", "/f"]).output();
-            return Ok("removed the watcher from startup (it stops at next logout)".into());
+            return Ok("stopped the watcher and removed it from startup".into());
         }
         let cmd = format!("conhost.exe --headless \"{}\" watch", bin().display());
         let out = Command::new("reg").args(["add", key, "/v", "steer-watch", "/t", "REG_SZ", "/d", &cmd, "/f"]).output().map_err(|e| e.to_string())?;
         if !out.status.success() {
             return Err(format!("reg said: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
-        let mut start = Command::new(bin());
-        start.arg("watch");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            start.creation_flags(0x0800_0000);
-        }
-        let _ = start.spawn();
+        spawn_watcher();
         Ok("the watcher now starts at login".into())
     } else {
         Ok("couldn't set the watcher to start at login on this system, run steer watch yourself".into())

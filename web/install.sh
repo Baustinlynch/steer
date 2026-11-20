@@ -20,11 +20,12 @@ echo "downloading steer..."
 curl -fsSL "https://github.com/EwoudVV/steer/releases/latest/download/$file" -o "$bin/steer.new"
 chmod +x "$bin/steer.new"
 mv "$bin/steer.new" "$bin/steer"
+echo
 
-if [ ! -f "$HOME/.steer/config.json" ]; then
-  echo "sign in with your hack club account:"
-  "$bin/steer" login < /dev/tty
+# steer install explains what it does and asks first. this script is piped into sh,
+# so the answer has to come from the terminal.
+if (: < /dev/tty) 2>/dev/null; then
+  "$bin/steer" install < /dev/tty
+else
+  "$bin/steer" install --yes
 fi
-
-"$bin/steer" setup
-echo "done. check on it anytime with: ~/.steer/bin/steer status"
