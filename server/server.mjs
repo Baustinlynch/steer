@@ -62,7 +62,7 @@ const count = (n, max) => (Number.isInteger(n) && n >= 0 ? Math.min(n, max) : 0)
 function accept(raw, now) {
   if (!raw || typeof raw !== "object") return null;
   const kind = raw.kind;
-  if (kind !== "prompt" && kind !== "tool" && kind !== "stop") return null;
+  if (!["prompt", "tool", "stop", "interrupt"].includes(kind)) return null;
   const t = typeof raw.t === "string" ? Date.parse(raw.t) : NaN;
   const id = clean(raw.id, 64);
   const session = clean(raw.session, 100);
@@ -72,6 +72,7 @@ function accept(raw, now) {
     id,
     session,
     project: clean(raw.project, 100) || "unknown",
+    via: clean(raw.via, 30) || "claude-code",
     kind,
     t: new Date(t).toISOString(),
     got: new Date(now).toISOString(),
@@ -112,6 +113,8 @@ function sessionsOf(name) {
         repeat: e.repeat,
       };
       s.events.push({ id: e.id, t, kind: "prompt", prompt });
+    } else if (e.kind === "interrupt") {
+      s.events.push({ id: e.id, t, kind: "interrupt" });
     } else {
       s.events.push({ id: e.id, t, kind: "agent", tools: e.kind === "tool" && e.tool ? [e.tool] : [] });
     }
@@ -219,7 +222,9 @@ function profilePage(res, name) {
 function projectPage(res, name, project) {
   const p = reportOf(name).find((x) => x.name === project);
   if (!p) return send(res, 404, "No such project");
+  const tools = [...new Set(eventsOf(name).events.filter((e) => e.project === project).map((e) => e.via ?? "claude-code"))];
   const body = `<h1><a href="/u/${encodeURIComponent(name)}">${esc(name)}</a> / ${esc(project)}</h1>
+<p class="muted">Tracked from ${esc(tools.join(", "))}.</p>
 ${renderReport([p], { window: "all time", source: "events the steer client sent while working" })}`;
   page(res, `${project} · steer`, body);
 }

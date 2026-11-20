@@ -1,0 +1,203 @@
+//! Reads Codex session files as they're written: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+//! (or under $CODEX_HOME). One JSON record per line, each with a timestamp.
+
+use crate::live::{event, home, project_name, prompt_event, tool_event};
+use crate::prompt::PromptInfo;
+use chrono::{DateTime, Utc};
+use serde_json::{json, Map, Value};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+pub const VIA: &str = "codex";
+/// Most to read from one file in one go, so a huge file can't stall the watcher.
+const MAX_READ: u64 = 32 * 1024 * 1024;
+
+fn root() -> PathBuf {
+    std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".codex")).join("sessions")
+}
+
+fn session_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            session_files(&path, out);
+        } else if path.extension().is_some_and(|x| x == "jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+/// Reads what's new in every session file. `state` keeps, per file, how far it's been
+/// read plus the session id and project. With `skip_existing`, files seen for the first
+/// time are skipped to their end (used on the very first run, so old history isn't sent).
+pub fn poll(state: &mut Map<String, Value>, skip_existing: bool) -> Vec<Value> {
+    let mut files = Vec::new();
+    session_files(&root(), &mut files);
+    let mut out = Vec::new();
+
+    for path in files {
+        let key = path.to_string_lossy().into_owned();
+        let Ok(len) = fs::metadata(&path).map(|m| m.len()) else { continue };
+        let entry = state
+            .entry(key.clone())
+            .or_insert_with(|| json!({ "offset": if skip_existing { len } else { 0 } }));
+        let mut offset = entry["offset"].as_u64().unwrap_or(0);
+        if len < offset {
+            offset = 0; // the file was replaced
+        }
+        if len == offset {
+            continue;
+        }
+        if entry.get("session").is_none() {
+            let (session, cwd) = read_meta(&path).unwrap_or_else(|| (stem(&path), String::new()));
+            entry["session"] = session.into();
+            entry["project"] = project_name(&cwd).into();
+        }
+        let session = entry["session"].as_str().unwrap_or_default().to_owned();
+        let mut project = entry["project"].as_str().unwrap_or("unknown").to_owned();
+
+        let Ok(mut file) = File::open(&path) else { continue };
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        let mut buf = Vec::new();
+        if file.take(MAX_READ).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        // Only whole lines. A line still being written gets picked up next time.
+        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { continue };
+        let mut pos = offset;
+        for line in buf[..end].split(|&b| b == b'\n') {
+            let line_offset = pos;
+            pos += line.len() as u64 + 1;
+            let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
+            if v.get("type").and_then(Value::as_str) == Some("turn_context") {
+                if let Some(cwd) = v.pointer("/payload/cwd").and_then(Value::as_str) {
+                    project = project_name(cwd);
+                }
+            }
+            if let Some(e) = parse(&v, &session, &project, line_offset) {
+                out.push(e);
+            }
+        }
+        entry["offset"] = (offset + end as u64 + 1).into();
+        entry["project"] = project.into();
+    }
+    state.retain(|k, _| Path::new(k).exists());
+    out
+}
+
+fn stem(path: &Path) -> String {
+    path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Session id and working folder from the session_meta record on the first line.
+fn read_meta(path: &Path) -> Option<(String, String)> {
+    let mut first = String::new();
+    BufReader::new(File::open(path).ok()?).take(4 * 1024 * 1024).read_line(&mut first).ok()?;
+    let v: Value = serde_json::from_str(&first).ok()?;
+    let p = v.get("payload")?;
+    let session = p.get("id").or_else(|| p.get("session_id"))?.as_str()?.to_owned();
+    let cwd = p.get("cwd").and_then(Value::as_str).unwrap_or_default().to_owned();
+    Some((session, cwd))
+}
+
+/// Turns one Codex record into an event, if it's one we count.
+pub fn parse(v: &Value, session: &str, project: &str, line_offset: u64) -> Option<Value> {
+    let t: DateTime<Utc> = DateTime::parse_from_rfc3339(v.get("timestamp")?.as_str()?).ok()?.with_timezone(&Utc);
+    let n = v.get("ordinal").and_then(Value::as_u64).unwrap_or(line_offset);
+    let id = format!("cx-{session}-{n}");
+    let p = v.get("payload")?;
+    let kind = p.get("type").and_then(Value::as_str).unwrap_or_default();
+    match v.get("type")?.as_str()? {
+        "response_item" if kind == "message" && p.get("role").and_then(Value::as_str) == Some("user") => {
+            let (text, images) = human_input(p)?;
+            Some(prompt_event(id, session, project, VIA, t, &PromptInfo::analyze(text.trim(), images)))
+        }
+        "response_item" if kind.ends_with("call") => {
+            let name = p.get("name").and_then(Value::as_str).unwrap_or(kind);
+            Some(tool_event(id, session, project, VIA, t, name))
+        }
+        "event_msg" if kind == "task_complete" => Some(event(id, session, project, VIA, t, "stop")),
+        "event_msg" if kind == "turn_aborted" => Some(event(id, session, project, VIA, t, "interrupt")),
+        _ => None,
+    }
+}
+
+/// The text and image count of a user message, or None if Codex wrote it itself
+/// (AGENTS.md instructions, environment context). Newer Codex labels every content
+/// item; things the person typed are labelled "user.*".
+fn human_input(p: &Value) -> Option<(String, usize)> {
+    let items = p.get("content")?.as_array()?;
+    let kinds: Option<Vec<&str>> = p
+        .pointer("/internal_chat_message_metadata_passthrough/content_item_kinds")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|k| k.as_str().unwrap_or_default()).collect());
+
+    let mut text = String::new();
+    let mut images = 0;
+    for (i, item) in items.iter().enumerate() {
+        let typed_by_person = match &kinds {
+            Some(k) => k.get(i).is_some_and(|k| k.starts_with("user.")),
+            None => true,
+        };
+        if !typed_by_person {
+            continue;
+        }
+        match item.get("type").and_then(Value::as_str) {
+            Some("input_text") => {
+                let s = item.get("text").and_then(Value::as_str).unwrap_or_default();
+                if kinds.is_none() && (s.trim_start().starts_with('<') || s.trim_start().starts_with("# AGENTS")) {
+                    continue; // older Codex without labels: skip what looks injected
+                }
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(s);
+            }
+            Some("input_image") => images += 1,
+            _ => {}
+        }
+    }
+    (!text.trim().is_empty() || images > 0).then_some((text, images))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(kind: &str, payload: Value) -> Value {
+        json!({ "timestamp": "2026-11-14T23:16:51.123Z", "ordinal": 7, "type": kind, "payload": payload })
+    }
+
+    #[test]
+    fn reads_prompts_tools_and_turn_ends() {
+        crate::live::use_temp_home();
+        let typed = rec("response_item", json!({
+            "type": "message", "role": "user",
+            "content": [{ "type": "input_text", "text": "the jump in player.rs feels floaty" }, { "type": "input_image" }],
+            "internal_chat_message_metadata_passthrough": { "content_item_kinds": ["user.text", "user.image"] }
+        }));
+        let e = parse(&typed, "s", "game", 0).unwrap();
+        assert_eq!(e["kind"], "prompt");
+        assert_eq!(e["images"], 1);
+        assert_eq!(e["observation"], true);
+        assert!(e.get("text").is_none());
+
+        let injected = rec("response_item", json!({
+            "type": "message", "role": "user",
+            "content": [{ "type": "input_text", "text": "# AGENTS.md ..." }, { "type": "input_text", "text": "<environment_context>" }],
+            "internal_chat_message_metadata_passthrough": { "content_item_kinds": ["agents_md.instructions", "environments.environment_context"] }
+        }));
+        assert!(parse(&injected, "s", "game", 0).is_none());
+
+        let call = rec("response_item", json!({ "type": "function_call", "name": "shell" }));
+        assert_eq!(parse(&call, "s", "game", 0).unwrap()["tool"], "shell");
+        assert_eq!(parse(&rec("event_msg", json!({ "type": "task_complete" })), "s", "g", 0).unwrap()["kind"], "stop");
+        let aborted = rec("event_msg", json!({ "type": "turn_aborted", "reason": "interrupted" }));
+        assert_eq!(parse(&aborted, "s", "g", 0).unwrap()["kind"], "interrupt");
+        assert!(parse(&rec("event_msg", json!({ "type": "token_count" })), "s", "g", 0).is_none());
+    }
+}

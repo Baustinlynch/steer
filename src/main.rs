@@ -1,10 +1,13 @@
 mod analyze;
+mod codex;
 mod claude;
 mod git;
 mod live;
 mod model;
+mod opencode;
 mod prompt;
 mod report;
+mod watch;
 
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
@@ -61,6 +64,14 @@ fn main() {
     match argv.first().map(String::as_str) {
         Some("hook") => return live::hook(),
         Some("signup" | "login" | "setup" | "status" | "flush") => std::process::exit(live::command(&argv)),
+        Some("watch") => {
+            if argv.iter().any(|a| a == "--dry-run") {
+                let days = argv.iter().position(|a| a == "--days").and_then(|i| argv.get(i + 1)).and_then(|d| d.parse().ok()).unwrap_or(30);
+                println!("{}", watch::dry_run(days));
+                return;
+            }
+            std::process::exit(watch::run());
+        }
         Some("report") => {
             argv.remove(0);
         }

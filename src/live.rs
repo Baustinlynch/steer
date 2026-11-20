@@ -5,7 +5,7 @@
 //! and never leaves this computer.
 
 use crate::prompt::PromptInfo;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -18,7 +18,7 @@ pub const DEFAULT_SERVER: &str = "https://steer.duck.hackclub.app";
 const HOOK_EVENTS: [&str; 3] = ["UserPromptSubmit", "PostToolUse", "Stop"];
 const BATCH: usize = 500;
 
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -26,19 +26,19 @@ fn home() -> PathBuf {
 }
 
 /// ~/.steer, or $STEER_HOME if set.
-fn dir() -> PathBuf {
+pub(crate) fn dir() -> PathBuf {
     std::env::var_os("STEER_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".steer"))
 }
 
 // ---------- config ----------
 
-struct Config {
+pub(crate) struct Config {
     server: String,
     key: String,
     name: Option<String>,
 }
 
-fn load_config() -> Option<Config> {
+pub(crate) fn load_config() -> Option<Config> {
     let v: Value = serde_json::from_str(&fs::read_to_string(dir().join("config.json")).ok()?).ok()?;
     Some(Config {
         server: v.get("server")?.as_str()?.to_owned(),
@@ -102,43 +102,75 @@ fn record() -> Option<()> {
     let session = v.get("session_id")?.as_str()?;
     let cwd = v.get("cwd").and_then(Value::as_str).unwrap_or("");
 
-    let mut e = Map::new();
-    e.insert("id".into(), new_id().into());
-    e.insert("session".into(), session.into());
-    e.insert("project".into(), project_name(cwd).into());
-    e.insert("t".into(), Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true).into());
-
-    match v.get("hook_event_name")?.as_str()? {
+    let project = project_name(cwd);
+    let e = match v.get("hook_event_name")?.as_str()? {
         "UserPromptSubmit" => {
             let text = v.get("prompt")?.as_str()?.trim();
-            let p = PromptInfo::analyze(text, 0);
-            let repeat = is_repeat(session, &p);
-            e.insert("kind".into(), "prompt".into());
-            e.insert("words".into(), p.words.into());
-            e.insert("chars".into(), p.chars.into());
-            e.insert("images".into(), p.images.into());
-            e.insert("specific".into(), p.specific.into());
-            e.insert("observation".into(), p.observation.into());
-            e.insert("generic".into(), p.generic.into());
-            e.insert("repeat".into(), repeat.into());
+            prompt_event(new_id(), session, &project, "claude-code", Utc::now(), &PromptInfo::analyze(text, 0))
         }
         "PostToolUse" => {
-            e.insert("kind".into(), "tool".into());
-            e.insert("tool".into(), v.get("tool_name").and_then(Value::as_str).unwrap_or("").into());
+            let tool = v.get("tool_name").and_then(Value::as_str).unwrap_or("");
+            tool_event(new_id(), session, &project, "claude-code", Utc::now(), tool)
         }
-        "Stop" => {
-            e.insert("kind".into(), "stop".into());
-        }
+        "Stop" => event(new_id(), session, &project, "claude-code", Utc::now(), "stop"),
         _ => return None,
-    }
-
-    fs::create_dir_all(dir()).ok()?;
-    let mut queue = OpenOptions::new().create(true).append(true).open(dir().join("queue.jsonl")).ok()?;
-    queue.write_all(format!("{}\n", Value::Object(e)).as_bytes()).ok()?;
+    };
+    enqueue(&[e])?;
     if !flushing() {
         spawn_flush();
     }
     Some(())
+}
+
+// ---------- events (shared by the hook and the watcher) ----------
+
+/// One event as it goes to the server. `via` is the tool it came from.
+pub(crate) fn event(id: String, session: &str, project: &str, via: &str, t: DateTime<Utc>, kind: &str) -> Value {
+    json!({
+        "id": id,
+        "session": session,
+        "project": project,
+        "via": via,
+        "kind": kind,
+        "t": t.to_rfc3339_opts(SecondsFormat::Millis, true),
+    })
+}
+
+pub(crate) fn tool_event(id: String, session: &str, project: &str, via: &str, t: DateTime<Utc>, tool: &str) -> Value {
+    let mut e = event(id, session, project, via, t, "tool");
+    e["tool"] = tool.into();
+    e
+}
+
+/// A prompt as counts and flags only. The text itself never goes into the event.
+pub(crate) fn prompt_event(
+    id: String,
+    session: &str,
+    project: &str,
+    via: &str,
+    t: DateTime<Utc>,
+    p: &PromptInfo,
+) -> Value {
+    let mut e = event(id, session, project, via, t, "prompt");
+    e["words"] = p.words.into();
+    e["chars"] = p.chars.into();
+    e["images"] = p.images.into();
+    e["specific"] = p.specific.into();
+    e["observation"] = p.observation.into();
+    e["generic"] = p.generic.into();
+    e["repeat"] = is_repeat(session, p).into();
+    e
+}
+
+/// Adds events to the queue on this computer. They get sent by `flush`.
+pub(crate) fn enqueue(events: &[Value]) -> Option<()> {
+    if events.is_empty() {
+        return Some(());
+    }
+    fs::create_dir_all(dir()).ok()?;
+    let mut queue = OpenOptions::new().create(true).append(true).open(dir().join("queue.jsonl")).ok()?;
+    let lines: String = events.iter().map(|e| format!("{e}\n")).collect();
+    queue.write_all(lines.as_bytes()).ok()
 }
 
 fn new_id() -> String {
@@ -147,7 +179,7 @@ fn new_id() -> String {
 }
 
 /// Folder name of the git repo the session is in, or of the folder itself.
-fn project_name(cwd: &str) -> String {
+pub(crate) fn project_name(cwd: &str) -> String {
     let start = Path::new(cwd);
     let mut d = Some(start);
     while let Some(p) = d {
@@ -213,7 +245,7 @@ fn lock_path() -> PathBuf {
 
 /// True if another `steer flush` is running. A lock older than a minute is from a
 /// flush that died and gets ignored.
-fn flushing() -> bool {
+pub(crate) fn flushing() -> bool {
     fs::metadata(lock_path())
         .and_then(|m| m.modified())
         .ok()
@@ -408,9 +440,11 @@ fn hooks_installed(settings: &Path) -> bool {
 pub const HELP: &str = "live tracking:
   steer signup NAME [--server URL]   make an account and save its key
   steer login KEY [--server URL]     use an account you already have
-  steer setup [--settings FILE]      add the steer hooks to Claude Code
-  steer setup --remove               take them out again
+  steer setup                        hook into Claude Code and start the watcher for
+                                     Codex and OpenCode at login
+  steer setup --remove               undo all of that
   steer status                       show what's set up and what's waiting to send
+  steer watch --dry-run [--days N]   show what the watcher would send, as counts
   steer flush                        send waiting events now";
 
 fn flag_value(args: &[String], name: &str) -> Option<String> {
@@ -437,8 +471,16 @@ pub fn command(args: &[String]) -> i32 {
         "signup" => signup(args),
         "login" => login(args),
         "setup" => {
-            let settings = flag_value(args, "--settings").map(PathBuf::from).unwrap_or_else(claude_settings);
-            setup(&settings, args.iter().any(|a| a == "--remove"))
+            let custom = flag_value(args, "--settings").map(PathBuf::from);
+            let remove = args.iter().any(|a| a == "--remove");
+            let settings = custom.clone().unwrap_or_else(claude_settings);
+            setup(&settings, remove).and_then(|hooks| {
+                // A custom settings file means a test run, so leave login items alone.
+                if custom.is_some() || args.iter().any(|a| a == "--no-watch") {
+                    return Ok(hooks);
+                }
+                crate::watch::autostart(remove).map(|w| format!("{hooks}\n{w}"))
+            })
         }
         "status" => Ok(status()),
         "flush" => flush().map(|n| format!("sent {n} events")),
@@ -495,8 +537,19 @@ fn status() -> String {
         "claude code hooks: {}\n",
         if hooks_installed(&settings) { "on" } else { "off, run steer setup" }
     );
+    out += &format!(
+        "watcher for codex and opencode: {}\n",
+        if crate::watch::running() { "running" } else { "not running, run steer setup" }
+    );
     out += &format!("waiting to send: {} events", queued());
     out
+}
+
+/// Points ~/.steer at a temp folder for tests, so they never touch the real one.
+#[cfg(test)]
+pub(crate) fn use_temp_home() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("STEER_HOME", std::env::temp_dir().join(format!("steer-tests-{}", std::process::id()))));
 }
 
 #[cfg(test)]
