@@ -589,19 +589,22 @@ pub fn uninstall(args: &[String]) -> Result<String, String> {
 fn delete_dir(path: &std::path::Path) -> Result<(), String> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
-        Err(_) if cfg!(windows) => {
-            let mut cmd = Command::new("cmd");
-            cmd.args(["/C", &format!("ping -n 4 127.0.0.1 >NUL & rmdir /S /Q \"{}\"", path.display())])
+        #[cfg(windows)]
+        Err(_) => {
+            use std::os::windows::process::CommandExt;
+            // Passed as one raw line: the normal argument quoting escapes the quotes
+            // around the path with backslashes, which cmd.exe doesn't understand.
+            Command::new("cmd")
+                .raw_arg(format!("/C ping -n 4 127.0.0.1 >NUL & rmdir /S /Q \"{}\"", path.display()))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-            }
-            cmd.spawn().map(|_| ()).map_err(|e| format!("couldn't delete {}: {e}", path.display()))
+                .stderr(Stdio::null())
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("couldn't delete {}: {e}", path.display()))
         }
+        #[cfg(not(windows))]
         Err(e) => Err(format!("couldn't delete {}: {e}", path.display())),
     }
 }
