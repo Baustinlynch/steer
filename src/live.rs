@@ -742,7 +742,7 @@ pub(crate) fn login(args: &[String]) -> Result<String, String> {
     let code = start.get("code").and_then(Value::as_str).ok_or("server didn't send a login code")?;
     let url = start.get("url").and_then(Value::as_str).ok_or("server didn't send a login link")?;
     let user_code = start.get("user_code").and_then(Value::as_str).unwrap_or_default();
-    println!("your code: {user_code}");
+    println!("your code: {user_code} (type it on the page that opens, only on a page you opened yourself)");
     println!("opening {url}");
     println!("(if no browser opens, open that link yourself)");
     open_browser(url);

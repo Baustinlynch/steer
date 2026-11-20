@@ -18,6 +18,7 @@ jobs:
       - run: node --check server/server.mjs && node --check web/steer.js && node --check web/app.js
       - run: node tests/login.mjs
       - run: node tests/counting.mjs
+      - run: node tests/server.mjs
       # installs, sends an event, updates and uninstalls a real build on each system
       - run: cargo build --release --locked
       - run: node tests/install.mjs

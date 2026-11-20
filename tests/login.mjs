@@ -33,10 +33,17 @@ const fake = createServer((req, res) => {
 });
 await new Promise((ok) => fake.listen(FAKE_PORT, ok));
 
-// An existing name-only account in the old one-key format.
+// An existing name-only account in the old one-key format, and one that belongs to
+// someone trying to phish others.
 const data = mkdtempSync(join(tmpdir(), "steer-login-"));
 mkdirSync(join(data, "events"));
-writeFileSync(join(data, "users.json"), JSON.stringify({ duck: { keyHash: sha256("oldkey"), created: "2026-11-19T00:00:00Z" } }));
+writeFileSync(
+  join(data, "users.json"),
+  JSON.stringify({
+    duck: { keyHash: sha256("oldkey"), created: "2026-11-19T00:00:00Z" },
+    evil: { keyHashes: [sha256("evilkey")], created: "2026-11-19T00:00:00Z" },
+  }),
+);
 
 const server = spawn("node", ["server/server.mjs"], {
   env: {
@@ -64,15 +71,35 @@ const json = async (path, opts = {}) => {
   return { status: res.status, body: await res.json() };
 };
 
+/** The terminal's side: starts a login, like `steer login` does. */
+async function start(key, ip = "10.0.0.1") {
+  const headers = { "x-forwarded-for": ip, ...(key ? { authorization: `Bearer ${key}` } : {}) };
+  const res = await json("/api/cli-login", { method: "POST", headers });
+  assert.equal(res.status, 200);
+  return res.body;
+}
+
+/** The browser sending the login form, with the code typed in. A header set to undefined is left out. */
+const typeCode = (code, userCode, headers = {}) =>
+  fetch(`${STEER}/login/go`, {
+    method: "POST",
+    headers: Object.fromEntries(
+      Object.entries({ origin: STEER, "sec-fetch-site": "same-origin", ...headers }).filter(([, v]) => v !== undefined),
+    ),
+    body: new URLSearchParams({ code, user_code: userCode }),
+    redirect: "manual",
+  });
+
 /** Runs one whole login like `steer login` and the browser would. */
 async function login(key) {
-  const start = await json("/api/cli-login", { method: "POST", headers: key ? { authorization: `Bearer ${key}` } : {} });
-  assert.equal(start.status, 200);
-  const page = await (await fetch(start.body.url)).text();
-  assert.ok(page.includes(start.body.user_code), "login page shows the same code as the terminal");
-  assert.equal((await json(`/api/cli-login/${start.body.code}`)).body.status, "pending");
+  const started = await start(key);
+  const page = await (await fetch(started.url)).text();
+  assert.ok(!page.includes(started.user_code), "the page doesn't show the code, it has to be typed from the terminal");
+  assert.ok(page.includes('name="user_code"'));
+  assert.equal((await json(`/api/cli-login/${started.code}`)).body.status, "pending");
 
-  const go = await fetch(`${STEER}/login/go?code=${start.body.code}`, { redirect: "manual" });
+  const go = await typeCode(started.code, started.user_code.toLowerCase().replace("-", " "));
+  assert.equal(go.status, 303, "the right code goes on to hack club, typed in any case");
   const authorize = new URL(go.headers.get("location"));
   assert.equal(authorize.searchParams.get("client_id"), "test-client");
   assert.equal(authorize.searchParams.get("scope"), "openid profile slack_id verification_status");
@@ -80,15 +107,18 @@ async function login(key) {
   const done = await (await fetch(back.headers.get("location"))).text();
   assert.ok(done.includes("Signed in as"), done);
 
-  const result = (await json(`/api/cli-login/${start.body.code}`)).body;
+  const result = (await json(`/api/cli-login/${started.code}`)).body;
   assert.equal(result.status, "done");
-  assert.equal((await json(`/api/cli-login/${start.body.code}`)).status, 404, "the key is only handed out once");
+  assert.equal((await json(`/api/cli-login/${started.code}`)).status, 404, "the key is only handed out once");
   return result;
 }
 
 try {
-  // 1. Existing account: logging in with its key links it instead of making a new one.
+  // 1. Existing account: logging in with its key links it instead of making a new one,
+  // and the page says which account that is.
   nextUser = { sub: "ident!aaa", nickname: "Duck", slack_id: "U123", verification_status: "verified", ysws_eligible: true };
+  const duckStart = await start("oldkey");
+  assert.match(await (await fetch(duckStart.url)).text(), /uses the steer account <b>duck<\/b>/);
   const linked = await login("oldkey");
   assert.equal(linked.name, "duck");
   const events = (key) => json("/api/events", { method: "POST", headers: { authorization: `Bearer ${key}` }, body: '{"events":[]}' });
@@ -115,6 +145,46 @@ try {
   assert.ok((await (await fetch(`${STEER}/auth/callback?code=x&state=nope`)).text()).includes("didn't work or expired"));
   assert.ok((await (await fetch(`${STEER}/login?code=nope`)).text()).includes("expired"));
   assert.equal((await json("/api/cli-login/nope")).body.status, "expired");
+
+  // 6. Phishing: someone starts a login with the key of their own unlinked account and
+  // sends the link to someone else. Opening it and clicking on doesn't get them anywhere.
+  nextUser = { sub: "ident!victim", nickname: "victim", slack_id: "UVICTIM", verification_status: "verified", ysws_eligible: true };
+  const phish = await start("evilkey", "10.6.6.6");
+  const victim = { "x-forwarded-for": "10.0.0.7" };
+  const lure = await (await fetch(phish.url, { headers: victim })).text();
+  assert.match(lure, /uses the steer account <b>evil<\/b>/, "the page says which account gets linked");
+  assert.ok(!lure.includes(phish.user_code), "and doesn't show the code to copy");
+  const oldLink = await fetch(`${STEER}/login/go?code=${phish.code}`, { headers: victim, redirect: "manual" });
+  assert.equal(oldLink.status, 303);
+  assert.equal(oldLink.headers.get("location"), `/login?code=${phish.code}`, "the old link goes back to the code form");
+  const noCode = await fetch(`${STEER}/login/go`, {
+    method: "POST",
+    headers: { origin: STEER, ...victim },
+    body: new URLSearchParams({ code: phish.code }),
+    redirect: "manual",
+  });
+  assert.equal(noCode.status, 400, "no code, no hack club");
+  assert.equal((await typeCode(phish.code, "0000-0000", victim)).status, 400, "a wrong code doesn't go on");
+  // A page on another site (or a sibling site on the same domain) that sends the form
+  // with the code filled in.
+  assert.equal((await typeCode(phish.code, phish.user_code, { ...victim, origin: "https://evil.example" })).status, 403);
+  assert.equal((await typeCode(phish.code, phish.user_code, { ...victim, origin: "null" })).status, 403);
+  assert.equal((await typeCode(phish.code, phish.user_code, { ...victim, origin: undefined, "sec-fetch-site": "same-site" })).status, 403);
+  assert.equal((await json(`/api/cli-login/${phish.code}`)).body.status, "pending", "the phisher's terminal got nothing");
+  assert.equal((await json("/api/u/evil")).body.hackclub, null, "and their account didn't get the victim's hack club");
+  // Guessing the code: a few wrong tries and the login is gone.
+  for (let i = 0; i < 4; i++) await typeCode(phish.code, `AAAA-000${i}`, { "x-forwarded-for": "10.6.6.6" });
+  assert.equal((await json(`/api/cli-login/${phish.code}`)).status, 404, "5 wrong codes and the login is thrown away");
+  assert.equal((await typeCode(phish.code, phish.user_code)).status, 400, "even the right code is too late then");
+
+  // 7. Logins per address are limited, and none of it piles up.
+  let limited = 0;
+  for (let i = 0; i < 25; i++) {
+    const res = await fetch(`${STEER}/api/cli-login`, { method: "POST", headers: { "x-forwarded-for": "10.9.9.9" } });
+    if (res.status === 429) limited++;
+  }
+  assert.equal(limited, 5, "20 logins from one address, then it has to wait");
+  assert.equal((await fetch(`${STEER}/api/cli-login`, { method: "POST", headers: { "x-forwarded-for": "10.9.9.10" } })).status, 200);
 
   console.log("login tests passed");
 } finally {
