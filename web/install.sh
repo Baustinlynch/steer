@@ -22,11 +22,8 @@ chmod +x "$bin/steer.new"
 mv "$bin/steer.new" "$bin/steer"
 
 if [ ! -f "$HOME/.steer/config.json" ]; then
-  while :; do
-    printf "pick a name for your steer page: "
-    read -r name < /dev/tty
-    "$bin/steer" signup "$name" && break
-  done
+  echo "sign in with your hack club account:"
+  "$bin/steer" login < /dev/tty
 fi
 
 "$bin/steer" setup

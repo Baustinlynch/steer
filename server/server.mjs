@@ -24,6 +24,15 @@ const WEB = process.env.STEER_WEB ?? join(here, "..", "web");
 // Events whose time is further than this from when the server got them don't count.
 // That's what stops someone from making up old sessions later.
 const LATE_SECS = 300;
+const PUBLIC_URL = (process.env.PUBLIC_URL ?? "https://steer.duck.hackclub.app").replace(/\/$/, "");
+// Sign in with Hack Club. Without these, the server falls back to name-only signup
+// (handy for running your own).
+const HCA =
+  process.env.HCA_CLIENT_ID && process.env.HCA_CLIENT_SECRET
+    ? { id: process.env.HCA_CLIENT_ID, secret: process.env.HCA_CLIENT_SECRET }
+    : null;
+const HCA_BASE = process.env.HCA_BASE ?? "https://auth.hackclub.com"; // changeable for tests
+const HCA_SCOPES = "openid profile slack_id verification_status";
 
 mkdirSync(join(DATA, "events"), { recursive: true });
 
@@ -31,7 +40,15 @@ mkdirSync(join(DATA, "events"), { recursive: true });
 
 const usersFile = join(DATA, "users.json");
 const users = existsSync(usersFile) ? JSON.parse(readFileSync(usersFile, "utf8")) : {};
-const byKey = new Map(Object.entries(users).map(([name, u]) => [u.keyHash, name]));
+// Accounts used to have one key; now each device gets its own.
+for (const u of Object.values(users)) {
+  if (u.keyHash && !u.keyHashes) {
+    u.keyHashes = [u.keyHash];
+    delete u.keyHash;
+  }
+}
+const byKey = new Map();
+for (const [name, u] of Object.entries(users)) for (const h of u.keyHashes ?? []) byKey.set(h, name);
 const cache = new Map(); // name -> { events: [], ids: Set }
 
 const sha256 = (s) => createHash("sha256").update(s).digest("hex");
@@ -39,6 +56,16 @@ const sha256 = (s) => createHash("sha256").update(s).digest("hex");
 function saveUsers() {
   writeFileSync(usersFile + ".tmp", JSON.stringify(users, null, 1));
   renameSync(usersFile + ".tmp", usersFile);
+}
+
+/** Makes a new key for an account and returns it. Only its hash is stored. */
+function addKey(name) {
+  const key = randomBytes(24).toString("base64url");
+  const hash = sha256(key);
+  users[name].keyHashes = [...(users[name].keyHashes ?? []), hash];
+  byKey.set(hash, name);
+  saveUsers();
+  return key;
 }
 
 function eventsOf(name) {
@@ -203,8 +230,12 @@ function profilePage(res, name) {
   const projects = reportOf(name);
   const late = lateCount(name);
   const last = eventsOf(name).events.at(-1);
+  const hc = users[name].hc;
+  const linked = hc
+    ? `Linked to a Hack Club account${hc.verification_status === "verified" ? " (verified)" : ""}.`
+    : "Not linked to a Hack Club account.";
   let body = `<h1>steer · ${esc(name)}</h1>
-<p class="muted">Live. This page reloads every 30 seconds. ${last ? `Last activity ${esc(new Date(last.got).toUTCString())}.` : "Nothing tracked yet."}</p>
+<p class="muted">Live. This page reloads every 30 seconds. ${last ? `Last activity ${esc(new Date(last.got).toUTCString())}.` : "Nothing tracked yet."} ${linked}</p>
 `;
   if (projects.length) {
     body += renderReport(projects, {
@@ -234,8 +265,11 @@ ${renderReport([p], { window: "all time", source: "events the steer client sent 
 function hoursJson(res, name, project) {
   const projects = reportOf(name).filter((p) => !project || p.name === project);
   if (project && !projects.length) return json(res, 404, { error: "no such project" });
+  const hc = users[name].hc;
   json(res, 200, {
     user: name,
+    // So programs can match hours to the person who submitted. Null if not linked.
+    hackclub: hc ? { slack_id: hc.slack_id, verification_status: hc.verification_status, ysws_eligible: hc.ysws_eligible } : null,
     projects: projects.map((p) => ({
       name: p.name,
       sessions: p.sessions.length,
@@ -246,9 +280,134 @@ function hoursJson(res, name, project) {
   });
 }
 
+// ---------- sign in with Hack Club ----------
+
+const LOGIN_TTL = 10 * 60 * 1000;
+const logins = new Map(); // login code -> { userCode, created, link, state, result }
+const byState = new Map(); // oauth state -> login code
+
+function sweepLogins() {
+  const now = Date.now();
+  for (const [code, l] of logins) {
+    if (now - l.created > LOGIN_TTL) {
+      logins.delete(code);
+      if (l.state) byState.delete(l.state);
+    }
+  }
+}
+
+function loginPage(res, code) {
+  const l = logins.get(code);
+  if (!l) return page(res, "steer login", `<h1>steer</h1>\n<p>This login link expired. Run <code>steer login</code> again.</p>`);
+  page(
+    res,
+    "steer login",
+    `<h1>Sign in to steer</h1>
+<p>Check that this code matches the one in your terminal:</p>
+<p class="code">${esc(l.userCode)}</p>
+<p><a class="button" href="/login/go?code=${encodeURIComponent(code)}">Continue with Hack Club</a></p>
+<p class="muted">Only continue if you just ran steer login on your own computer. That terminal gets signed in as you.</p>`,
+  );
+}
+
+function loginRedirect(res, code) {
+  const l = logins.get(code);
+  if (!l || !HCA) return loginPage(res, code);
+  l.state = randomBytes(16).toString("base64url");
+  byState.set(l.state, code);
+  const q = new URLSearchParams({
+    client_id: HCA.id,
+    redirect_uri: `${PUBLIC_URL}/auth/callback`,
+    response_type: "code",
+    scope: HCA_SCOPES,
+    state: l.state,
+  });
+  res.writeHead(302, { location: `${HCA_BASE}/oauth/authorize?${q}` });
+  res.end();
+}
+
+/** A free profile name based on someone's Hack Club nickname. */
+function freeName(raw) {
+  let base = String(raw ?? "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "")
+    .slice(0, 28);
+  if (!NAME.test(base)) base = "hackclubber";
+  let name = base;
+  for (let i = 2; users[name]; i++) name = `${base}-${i}`;
+  return name;
+}
+
+async function authCallback(res, authCode, state) {
+  const code = byState.get(state);
+  const l = code && logins.get(code);
+  if (!l || !HCA || !authCode) {
+    return page(res, "steer login", `<h1>steer</h1>\n<p>This login didn't work or expired. Run <code>steer login</code> again.</p>`);
+  }
+  byState.delete(state);
+  let info;
+  try {
+    const tokenRes = await fetch(`${HCA_BASE}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_id: HCA.id,
+        client_secret: HCA.secret,
+        redirect_uri: `${PUBLIC_URL}/auth/callback`,
+        code: authCode,
+        grant_type: "authorization_code",
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!tokenRes.ok) throw new Error(`token ${tokenRes.status}`);
+    const { access_token } = await tokenRes.json();
+    const infoRes = await fetch(`${HCA_BASE}/oauth/userinfo`, {
+      headers: { authorization: `Bearer ${access_token}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!infoRes.ok) throw new Error(`userinfo ${infoRes.status}`);
+    info = await infoRes.json();
+  } catch (err) {
+    console.error("hack club login failed:", err.message);
+    return page(res, "steer login", `<h1>steer</h1>\n<p>Hack Club didn't confirm the login. Run <code>steer login</code> again.</p>`);
+  }
+  if (!info?.sub) return page(res, "steer login", `<h1>steer</h1>\n<p>Hack Club didn't send an account id.</p>`);
+
+  // Same Hack Club account as before, or link the account the terminal was already
+  // using, or make a new one.
+  const now = new Date().toISOString();
+  let name = Object.keys(users).find((n) => users[n].hc?.sub === info.sub);
+  if (!name && l.link && users[l.link] && !users[l.link].hc) name = l.link;
+  if (!name) {
+    name = freeName(info.nickname || info.given_name || info.name);
+    users[name] = { keyHashes: [], created: now };
+  }
+  // Only what programs need to match hours to people. No email, name or address.
+  users[name].hc = {
+    sub: info.sub,
+    slack_id: info.slack_id ?? null,
+    verification_status: info.verification_status ?? null,
+    ysws_eligible: info.ysws_eligible ?? null,
+    updated: now,
+  };
+  l.result = { name, key: addKey(name) };
+  page(
+    res,
+    "steer login",
+    `<h1>Signed in as ${esc(name)}</h1>
+<p>Go back to your terminal, it finishes by itself. You can close this tab.</p>
+<p><a href="/u/${encodeURIComponent(name)}">Your page</a></p>`,
+  );
+}
+
+// ---------- requests ----------
+
 async function handle(req, res) {
   const url = new URL(req.url, "http://x");
   const path = url.pathname;
+  let m;
 
   if (req.method === "GET" && STATIC[path]) {
     const [file, type] = STATIC[path];
@@ -256,15 +415,39 @@ async function handle(req, res) {
   }
 
   if (req.method === "POST" && path === "/api/signup") {
+    if (HCA) return json(res, 410, { error: "this server uses hack club accounts, run steer login instead" });
     const body = await readJson(req);
     const name = typeof body?.name === "string" ? body.name.toLowerCase() : "";
     if (!NAME.test(name)) return json(res, 400, { error: "names are 2-32 letters, numbers, - or _" });
     if (users[name]) return json(res, 409, { error: "that name is taken" });
-    const key = randomBytes(24).toString("base64url");
-    users[name] = { keyHash: sha256(key), created: new Date().toISOString() };
-    byKey.set(users[name].keyHash, name);
-    saveUsers();
-    return json(res, 201, { name, key });
+    users[name] = { keyHashes: [], created: new Date().toISOString() };
+    return json(res, 201, { name, key: addKey(name) });
+  }
+
+  // ----- sign in with Hack Club -----
+  // The terminal asks for a login code, opens /login?code=..., and polls until the
+  // browser side is done. The short user code is shown in both places so someone
+  // can't trick you into signing in their terminal as you.
+  if (req.method === "POST" && path === "/api/cli-login") {
+    if (!HCA) return json(res, 503, { error: "this server doesn't have hack club login set up, use steer signup" });
+    sweepLogins();
+    const code = randomBytes(16).toString("base64url");
+    const hex = randomBytes(4).toString("hex").toUpperCase();
+    const userCode = `${hex.slice(0, 4)}-${hex.slice(4)}`;
+    logins.set(code, { userCode, created: Date.now(), link: userFromKey(req), result: null });
+    return json(res, 200, { code, user_code: userCode, url: `${PUBLIC_URL}/login?code=${code}` });
+  }
+  if (req.method === "GET" && (m = /^\/api\/cli-login\/([A-Za-z0-9_-]+)$/.exec(path))) {
+    const l = logins.get(m[1]);
+    if (!l) return json(res, 404, { status: "expired" });
+    if (!l.result) return json(res, 200, { status: "pending" });
+    logins.delete(m[1]);
+    return json(res, 200, { status: "done", ...l.result });
+  }
+  if (req.method === "GET" && path === "/login") return loginPage(res, url.searchParams.get("code") ?? "");
+  if (req.method === "GET" && path === "/login/go") return loginRedirect(res, url.searchParams.get("code") ?? "");
+  if (req.method === "GET" && path === "/auth/callback") {
+    return authCallback(res, url.searchParams.get("code") ?? "", url.searchParams.get("state") ?? "");
   }
 
   if (req.method === "POST" && path === "/api/events") {
@@ -286,7 +469,6 @@ async function handle(req, res) {
     return json(res, 200, { accepted: fresh.length, late: fresh.filter((e) => e.late).length });
   }
 
-  let m;
   if (req.method === "GET" && (m = /^\/u\/([^/]+)\/?$/.exec(path))) {
     const name = decodeURIComponent(m[1]);
     return users[name] ? profilePage(res, name) : send(res, 404, "No such user");

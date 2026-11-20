@@ -13,10 +13,9 @@ Get-Process steer -ErrorAction SilentlyContinue | Stop-Process -Force
 Move-Item -Force "$exe.new" $exe
 
 if (-not (Test-Path (Join-Path $HOME ".steer\config.json"))) {
-  do {
-    $name = Read-Host "pick a name for your steer page"
-    & $exe signup $name
-  } until ($LASTEXITCODE -eq 0)
+  Write-Host "sign in with your hack club account:"
+  & $exe login
+  if ($LASTEXITCODE -ne 0) { exit 1 }
 }
 
 & $exe setup

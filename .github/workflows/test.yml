@@ -16,3 +16,4 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo test --locked
       - run: node --check server/server.mjs && node --check web/steer.js && node --check web/app.js
+      - run: node tests/login.mjs

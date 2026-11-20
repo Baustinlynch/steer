@@ -54,7 +54,7 @@ fn another_watcher_alive() -> bool {
 
 pub fn run() -> i32 {
     if load_config().is_none() {
-        eprintln!("steer: not signed in, run steer signup or steer login first");
+        eprintln!("steer: not signed in, run steer login first");
         return 1;
     }
     if another_watcher_alive() {

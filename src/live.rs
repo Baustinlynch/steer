@@ -330,7 +330,7 @@ fn spawn_flush() {
 /// Sends everything in the queue. Events that can't be sent stay queued for next time.
 /// Returns how many were sent, or an error if sending stopped early.
 pub fn flush() -> Result<usize, String> {
-    let Some(config) = load_config() else { return Err("not signed in, run steer signup or steer login".into()) };
+    let Some(config) = load_config() else { return Err("not signed in, run steer login".into()) };
     if flushing() {
         return Ok(0);
     }
@@ -566,8 +566,9 @@ fn cursor_hooks_installed() -> bool {
 // ---------- commands ----------
 
 pub const HELP: &str = "live tracking:
-  steer signup NAME [--server URL]   make an account and save its key
-  steer login KEY [--server URL]     use an account you already have
+  steer login                        sign in with your hack club account
+  steer login KEY [--server URL]     use a key you already have
+  steer signup NAME --server URL     make an account on a server without hack club login
   steer setup                        hook into Claude Code and Cursor, and start the
                                      watcher for Codex, OpenCode and Copilot at login
   steer setup --remove               undo all of that
@@ -645,11 +646,80 @@ fn signup(args: &[String]) -> Result<String, String> {
 }
 
 fn login(args: &[String]) -> Result<String, String> {
-    let key = positional(args).ok_or("usage: steer login KEY")?;
-    let server = flag_value(args, "--server").unwrap_or_else(|| DEFAULT_SERVER.into());
-    post(&server, "/api/events", Some(key), &json!({ "events": [] }))?;
-    save_config(&Config { server, key: key.clone(), name: None })?;
-    Ok("key works, saved. next: steer setup".into())
+    let server = flag_value(args, "--server")
+        .or_else(|| load_config().map(|c| c.server))
+        .unwrap_or_else(|| DEFAULT_SERVER.into());
+    if let Some(key) = positional(args) {
+        post(&server, "/api/events", Some(key), &json!({ "events": [] }))?;
+        save_config(&Config { server, key: key.clone(), name: None })?;
+        return Ok("key works, saved. next: steer setup".into());
+    }
+
+    // Sign in with Hack Club in the browser. If this computer already has a key, it's
+    // sent along so the server links that account instead of making a new one.
+    let existing = load_config().filter(|c| c.server == server).map(|c| c.key);
+    let start = post(&server, "/api/cli-login", existing.as_deref(), &json!({}))?;
+    let code = start.get("code").and_then(Value::as_str).ok_or("server didn't send a login code")?;
+    let url = start.get("url").and_then(Value::as_str).ok_or("server didn't send a login link")?;
+    let user_code = start.get("user_code").and_then(Value::as_str).unwrap_or_default();
+    println!("your code: {user_code}");
+    println!("opening {url}");
+    println!("(if no browser opens, open that link yourself)");
+    open_browser(url);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(2));
+        let Ok(v) = get(&server, &format!("/api/cli-login/{code}")) else { continue };
+        match v.get("status").and_then(Value::as_str) {
+            Some("done") => {
+                let key = v.get("key").and_then(Value::as_str).ok_or("server didn't send a key")?;
+                let name = v.get("name").and_then(Value::as_str).map(str::to_owned);
+                save_config(&Config { server: server.clone(), key: key.into(), name: name.clone() })?;
+                let name = name.unwrap_or_default();
+                return Ok(format!(
+                    "signed in as {name}\nyour page: {}/u/{name}\nnext: steer setup (skip if you already did)",
+                    server.trim_end_matches('/')
+                ));
+            }
+            Some("expired") => return Err("the login link expired, run steer login again".into()),
+            _ => {}
+        }
+    }
+    Err("timed out waiting for the browser, run steer login again".into())
+}
+
+fn get(server: &str, path: &str) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
+    match agent.get(&format!("{}{}", server.trim_end_matches('/'), path)).call() {
+        Ok(resp) => serde_json::from_str(&resp.into_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, resp)) => {
+            // 404 on a login code means it expired, which the body says too.
+            let text = resp.into_string().unwrap_or_default();
+            serde_json::from_str(&text).map_err(|_| format!("server said {code}"))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn open_browser(url: &str) {
+    if std::env::var_os("STEER_NO_BROWSER").is_some() {
+        return;
+    }
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
 fn status() -> String {
@@ -663,7 +733,7 @@ fn status() -> String {
                 out += &format!("page: {}/u/{n}\n", c.server.trim_end_matches('/'));
             }
         }
-        None => out += "account: none yet, run steer signup NAME\n",
+        None => out += "account: none yet, run steer login\n",
     }
     out += &format!(
         "claude code hooks: {}\n",
