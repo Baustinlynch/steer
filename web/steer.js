@@ -519,10 +519,89 @@ const ACTIONS = {
   rejected: "Rejected tool call",
 };
 
+// ---------- checks for reviewers ----------
+
+/**
+ * Things about a day that a reviewer might want to look at, worked out from the same
+ * turns the totals come from. Someone can script fake events with their own key, so
+ * these are how it would show. Most have honest reasons too, so they're worded as things
+ * to look at. Days are UTC. Returns [{ day: "2026-11-20", notes: ["..."] }], newest first.
+ */
+export function checks(projects) {
+  const days = new Map();
+  for (const p of projects) {
+    for (const s of p.sessions) {
+      for (const t of s.turns) {
+        const day = new Date(t.t).toISOString().slice(0, 10);
+        if (!days.has(day)) days.set(day, []);
+        days.get(day).push(t);
+      }
+    }
+  }
+  const out = [];
+  for (const [day, turns] of days) {
+    turns.sort((a, b) => a.t - b.t);
+    const notes = [];
+    const human = turns.reduce((n, t) => n + t.human, 0);
+    const overlap = turns.reduce((n, t) => n + t.overlap, 0);
+    if (human > 12 * 3600) notes.push(`${fmtDur(human)} counted in one day`);
+
+    const span = (turns[turns.length - 1].t - turns[0].t) / 1000;
+    let longestBreak = 0;
+    for (let i = 1; i < turns.length; i++) longestBreak = Math.max(longestBreak, (turns[i].t - turns[i - 1].t) / 1000);
+    if (span > 16 * 3600 && longestBreak < 2 * 3600) {
+      notes.push(`active for ${fmtDur(span)} with no break longer than ${fmtDur(Math.round(longestBreak))}`);
+    }
+
+    const prompts = turns.filter((t) => t.kind === "prompt");
+    const answered = (t) => t.agent > 0 || t.tools.some((n) => n > 0);
+    const unanswered = prompts.filter((t) => !answered(t)).length;
+    if (prompts.length >= 10 && unanswered > prompts.length / 4) {
+      notes.push(`${unanswered} of ${prompts.length} prompts got no answer from an agent`);
+    }
+    const tooFast = prompts.filter((t) => t.why.rule === "wall").length;
+    if (prompts.length >= 10 && tooFast > prompts.length * 0.3) {
+      notes.push(`${tooFast} of ${prompts.length} prompts came faster than they could be typed`);
+    }
+
+    const replies = prompts.filter((t) => t.fromAgent && (t.why.rule === "reply" || t.why.rule === "typing")).map((t) => t.why.gap);
+    if (replies.length >= 30) {
+      replies.sort((a, b) => a - b);
+      const median = replies[Math.floor(replies.length / 2)];
+      if (median < 15) notes.push(`replies usually came ${median}s after the agent stopped`);
+    }
+    if (prompts.length >= 30) {
+      const gaps = prompts.slice(1).map((t, i) => (t.t - prompts[i].t) / 1000);
+      const mean = gaps.reduce((n, g) => n + g, 0) / gaps.length;
+      const sd = Math.sqrt(gaps.reduce((n, g) => n + (g - mean) ** 2, 0) / gaps.length);
+      if (mean > 0 && sd / mean < 0.5) notes.push("prompts came at very even intervals");
+    }
+    if (overlap > 30 * 60) notes.push(`${fmtDur(overlap)} in sessions at the same time, counted once`);
+    if (notes.length) out.push({ day, notes });
+  }
+  return out.sort((a, b) => (a.day < b.day ? 1 : -1));
+}
+
+function renderChecks(projects) {
+  const found = checks(projects);
+  let h = `<h2>Checks</h2>\n`;
+  if (!found.length) return h + "<p>Nothing stood out.</p>\n";
+  h += `<p class="muted">Things a reviewer might want to look at. Most have honest reasons, like a long hackathon day or running two agents at once.</p>\n<ul>\n`;
+  for (const { day, notes } of found) h += `<li>${day}: ${notes.map(esc).join(", ")}</li>\n`;
+  return h + "</ul>\n";
+}
+
 /** The report itself, as an HTML fragment. */
 export function renderReport(
   projects,
-  { window: span, hideTitles = false, source = "your Claude Code logs", sessions: showSessions = true, projectLink = null },
+  {
+    window: span,
+    hideTitles = false,
+    source = "your Claude Code logs",
+    sessions: showSessions = true,
+    projectLink = null,
+    checks: showChecks = true,
+  },
 ) {
   const human = sum(projects, projectHuman);
   const agent = sum(projects, projectAgent);
@@ -543,6 +622,8 @@ export function renderReport(
 `;
 
   const scale = Math.max(1, ...projects.map((p) => Math.max(projectHuman(p), projectAgent(p))));
+  if (showChecks) h += renderChecks(projects);
+
   h += `<h2>Projects</h2>
 <div class="scroll"><table class="list">
 <tr><th>Project</th><th class="r">Sessions</th><th class="r">Your time</th><th class="r">Agent time</th><th class="r">1/3 rule</th><th class="bars">Black: you, gray: agent</th></tr>

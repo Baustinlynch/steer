@@ -4,7 +4,7 @@
 //   node tests/counting.mjs
 
 import assert from "node:assert/strict";
-import { buildReport, projectHuman, projectOverlap } from "../web/steer.js";
+import { buildReport, checks, projectHuman, projectOverlap } from "../web/steer.js";
 
 const T0 = Date.UTC(2026, 10, 20, 15, 0, 0);
 const sec = (s) => T0 + s * 1000;
@@ -82,5 +82,39 @@ const honest = () => {
   // first prompt: 75 s of typing, then 5 replies of 560 s each
   assert.equal(r, 75 + 5 * 560, `honest session counted ${r}s`);
 }
+
+// 8. Checks a reviewer sees. A script that runs for 2 days with a real looking rhythm
+// (prompt, agent works 1 to 2 min, 2 to 9 min of "review") gets flagged.
+let seed = 7;
+const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+const reportOf = (sessions) => buildReport(sessions, { days: null, now: sec(10 * 86400) });
+{
+  const events = [];
+  for (let s = 0; s < 2 * 86400; ) {
+    events.push(prompt(s, 200 + Math.round(rand() * 400)));
+    const work = 60 + Math.round(rand() * 60);
+    for (let a = 10; a < work; a += 20) events.push(agent(s + a));
+    events.push(agent(s + work));
+    s += work + 120 + Math.round(rand() * 420);
+  }
+  const notes = checks(reportOf([session("script", events)])).flatMap((d) => d.notes).join(" | ");
+  assert.match(notes, /counted in one day/);
+  assert.match(notes, /no break longer than/);
+}
+// An auto-prompter answering a few seconds after every stop.
+{
+  const events = [];
+  for (let k = 0, s = 0; k < 40; k++) {
+    events.push(prompt(s, 400));
+    const work = 120 + Math.round(rand() * 180);
+    for (let a = 15; a < work; a += 30) events.push(agent(s + a));
+    events.push(agent(s + work));
+    s += work + 3 + Math.round(rand() * 10);
+  }
+  const notes = checks(reportOf([session("bot", events)])).flatMap((d) => d.notes).join(" | ");
+  assert.match(notes, /replies usually came \d+s after the agent stopped/);
+}
+// The honest session from 7 has nothing to look at.
+assert.deepEqual(checks(reportOf([session("normal", honest())])), []);
 
 console.log("counting tests passed");
