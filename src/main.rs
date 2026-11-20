@@ -64,7 +64,34 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
+/// Windows gives a new process every inheritable handle its parent has. steer's own
+/// stdin/stdout/stderr are often pipes that Claude Code or a terminal reads from, so a
+/// background `steer flush` or watcher would hold them open and whoever started steer
+/// would wait until that background process exits. Marking them non-inheritable stops
+/// that; child processes still get the stdio each Command asks for.
+#[cfg(windows)]
+fn stop_handle_inheritance() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+    for which in [-10i32, -11, -12] {
+        // SAFETY: plain Win32 calls on this process's own standard handles.
+        unsafe {
+            let handle = GetStdHandle(which as u32);
+            if !handle.is_null() && handle as isize != -1 {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    stop_handle_inheritance();
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
         None => std::process::exit(manage::bare()),

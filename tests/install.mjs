@@ -35,16 +35,22 @@ const startup = join(home, process.platform === "darwin" ? ".bash_profile" : ".b
 writeFileSync(startup, "echo hi\n");
 
 /** Runs steer and returns its output. Fails the test on a non-zero exit unless `allowFail`.
- * Not spawnSync: that would block the fake GitHub below, which runs in this process. */
+ * Not spawnSync: that would block the fake GitHub below, which runs in this process.
+ * Also fails if steer's output pipe stays open after it exits, which means a background
+ * process it started kept it. Claude Code would then wait on every hook. */
 async function steer(exe, args, { input, allowFail } = {}) {
+  console.log(`  steer ${args.join(" ")}`);
   const child = spawn(exe, args, { env });
   let out = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (out += d));
   child.stdin.end(input ?? "");
+  const closed = new Promise((ok) => child.on("close", () => ok(true)));
   const timer = setTimeout(() => child.kill(), 60_000);
-  const code = await new Promise((ok) => child.on("close", ok));
+  const code = await new Promise((ok) => child.on("exit", ok));
   clearTimeout(timer);
+  const pipeClosed = await Promise.race([closed, sleep(5_000).then(() => false)]);
+  assert.ok(pipeClosed, `steer ${args.join(" ")} exited but something it started kept its output pipe open:\n${out}`);
   if (!allowFail) assert.equal(code, 0, `steer ${args.join(" ")} failed:\n${out}`);
   return out;
 }
@@ -88,6 +94,7 @@ try {
   latest = version.split(" ")[1];
 
   // 1. Install. Signing in through the browser can't happen here, so sign up first.
+  console.log("step 1");
   await steer(built, ["signup", "ci", "--server", `http://127.0.0.1:${STEER_PORT}`]);
   const installed = await steer(built, ["install", "--yes"]);
   assert.match(installed, /found: claude code/);
@@ -99,6 +106,7 @@ try {
   if (!windows) assert.match(readFileSync(startup, "utf8"), /^echo hi\n\n# added by steer.*\nexport PATH=".*\.steer.bin:\$PATH"\n$/);
 
   // 2. A prompt in Claude Code reaches the server, with counts and no text.
+  console.log("step 2");
   const prompt = "make the save button blue and show a message when it worked";
   const hookOut = await steer(bin, ["hook"], {
     input: JSON.stringify({ session_id: "s1", cwd: join(home, "proj"), hook_event_name: "UserPromptSubmit", prompt }),
@@ -116,13 +124,16 @@ try {
   assert.match(await steer(bin, ["status"]), /last sent: just now/);
 
   // 3. The watcher starts and checks in.
+  console.log("step 3");
   watcher = spawn(bin, ["watch"], { env, stdio: "ignore" });
   await until("the watcher to check in", () => existsSync(join(steerDir, "watch.lock")));
 
   // 4. Doctor is happy.
+  console.log("step 4");
   assert.match(await steer(bin, ["doctor"]), /everything looks good/);
 
   // 5. A new version comes out. steer update swaps itself out while it runs, which on
+  console.log("step 5");
   // Windows means renaming its own exe, and restarts the watcher.
   latest = "999.0.0";
   assert.match(await steer(bin, ["doctor"], { allowFail: true }), /steer 999\.0\.0 is out, run steer update/);
@@ -132,6 +143,7 @@ try {
   assert.deepEqual(leftovers, [], "no half finished downloads left behind");
 
   // 6. Uninstall takes the hooks out and deletes ~/.steer. Stop the watcher first, it
+  console.log("step 6");
   // was started by this test rather than a login item. (On Windows the update just
   // restarted it, so wait for the new one to check in.)
   const lock = join(steerDir, "watch.lock");
@@ -150,6 +162,12 @@ try {
   console.log("install tests passed");
 } finally {
   watcher?.kill();
+  // A watcher restarted by steer update isn't a child of this test.
+  const lockFile = join(steerDir, "watch.lock");
+  if (existsSync(lockFile)) {
+    const left = readFileSync(lockFile, "utf8").trim();
+    if (left) spawnSync(windows ? "taskkill" : "kill", windows ? ["/PID", left, "/F"] : [left]);
+  }
   server.kill();
   releases.close();
   await sleep(500);
