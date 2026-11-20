@@ -3,90 +3,40 @@
 
 use crate::live::{event, home, project_name, prompt_event, tool_event};
 use crate::prompt::PromptInfo;
+use crate::tail;
 use chrono::{DateTime, Utc};
-use serde_json::{json, Map, Value};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use serde_json::{Map, Value};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 pub const VIA: &str = "codex";
-/// Most to read from one file in one go, so a huge file can't stall the watcher.
-const MAX_READ: u64 = 32 * 1024 * 1024;
 
 fn root() -> PathBuf {
     std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".codex")).join("sessions")
 }
 
-fn session_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            session_files(&path, out);
-        } else if path.extension().is_some_and(|x| x == "jsonl") {
-            out.push(path);
-        }
-    }
-}
-
-/// Reads what's new in every session file. `state` keeps, per file, how far it's been
-/// read plus the session id and project. With `skip_existing`, files seen for the first
-/// time are skipped to their end (used on the very first run, so old history isn't sent).
+/// Reads what's new in every session file. See `tail::poll`.
 pub fn poll(state: &mut Map<String, Value>, skip_existing: bool) -> Vec<Value> {
     let mut files = Vec::new();
-    session_files(&root(), &mut files);
-    let mut out = Vec::new();
-
-    for path in files {
-        let key = path.to_string_lossy().into_owned();
-        let Ok(len) = fs::metadata(&path).map(|m| m.len()) else { continue };
-        let entry = state
-            .entry(key.clone())
-            .or_insert_with(|| json!({ "offset": if skip_existing { len } else { 0 } }));
-        let mut offset = entry["offset"].as_u64().unwrap_or(0);
-        if len < offset {
-            offset = 0; // the file was replaced
-        }
-        if len == offset {
-            continue;
-        }
-        if entry.get("session").is_none() {
-            let (session, cwd) = read_meta(&path).unwrap_or_else(|| (stem(&path), String::new()));
-            entry["session"] = session.into();
-            entry["project"] = project_name(&cwd).into();
-        }
-        let session = entry["session"].as_str().unwrap_or_default().to_owned();
-        let mut project = entry["project"].as_str().unwrap_or("unknown").to_owned();
-
-        let Ok(mut file) = File::open(&path) else { continue };
-        if file.seek(SeekFrom::Start(offset)).is_err() {
-            continue;
-        }
-        let mut buf = Vec::new();
-        if file.take(MAX_READ).read_to_end(&mut buf).is_err() {
-            continue;
-        }
-        // Only whole lines. A line still being written gets picked up next time.
-        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { continue };
-        let mut pos = offset;
-        for line in buf[..end].split(|&b| b == b'\n') {
-            let line_offset = pos;
-            pos += line.len() as u64 + 1;
-            let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
+    tail::jsonl_files(&root(), &mut files);
+    tail::poll(
+        files,
+        state,
+        skip_existing,
+        |path| {
+            let (session, cwd) = read_meta(path).unwrap_or_else(|| (stem(path), String::new()));
+            (session, project_name(&cwd))
+        },
+        |v, ctx, line_offset| {
             if v.get("type").and_then(Value::as_str) == Some("turn_context") {
                 if let Some(cwd) = v.pointer("/payload/cwd").and_then(Value::as_str) {
-                    project = project_name(cwd);
+                    ctx.project = project_name(cwd);
                 }
             }
-            if let Some(e) = parse(&v, &session, &project, line_offset) {
-                out.push(e);
-            }
-        }
-        entry["offset"] = (offset + end as u64 + 1).into();
-        entry["project"] = project.into();
-    }
-    state.retain(|k, _| Path::new(k).exists());
-    out
+            parse(v, &ctx.session, &ctx.project, line_offset)
+        },
+    )
 }
 
 fn stem(path: &Path) -> String {
@@ -167,6 +117,7 @@ fn human_input(p: &Value) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn rec(kind: &str, payload: Value) -> Value {
         json!({ "timestamp": "2026-11-14T23:16:51.123Z", "ordinal": 7, "type": kind, "payload": payload })

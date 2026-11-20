@@ -89,10 +89,64 @@ fn post(server: &str, path: &str, key: Option<&str>, body: &Value) -> Result<Val
 
 // ---------- the hook ----------
 
-/// Called by Claude Code. Never prints and never fails: anything printed on a prompt
-/// gets added to the prompt, and Claude Code waits for this to finish.
-pub fn hook() {
-    let _ = record();
+/// Called by Claude Code (`steer hook`) or Cursor (`steer hook cursor EVENT`). Never
+/// fails, and the tool waits for it, so it only queues and returns.
+pub fn hook(args: &[String]) {
+    if args.first().map(String::as_str) == Some("cursor") {
+        let event = args.get(1).map(String::as_str).unwrap_or_default();
+        let _ = record_cursor(event);
+        // Cursor reads the answer as JSON. Always let the prompt through.
+        println!("{}", if event == "prompt" { r#"{"continue":true}"# } else { "{}" });
+    } else {
+        // Claude Code: print nothing, anything printed on a prompt gets added to it.
+        let _ = record();
+    }
+}
+
+/// Cursor's hooks send conversation_id and workspace_roots, plus the prompt text on
+/// beforeSubmitPrompt and tool_name on postToolUse. Not tried against real Cursor use
+/// yet: written from Cursor's hooks docs.
+fn record_cursor(which: &str) -> Option<()> {
+    let mut input = String::new();
+    std::io::stdin().take(20_000_000).read_to_string(&mut input).ok()?;
+    let v: Value = serde_json::from_str(&input).ok()?;
+    let session = v.get("conversation_id").and_then(Value::as_str)?;
+    let root = v.pointer("/workspace_roots/0").and_then(Value::as_str).unwrap_or_default();
+    let project = project_name(root);
+    let e = match which {
+        "prompt" => {
+            let text = v.get("prompt").and_then(Value::as_str).unwrap_or_default().trim();
+            let images = v
+                .get("attachments")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter(|a| {
+                            ["type", "mime_type", "mimeType"]
+                                .iter()
+                                .filter_map(|k| a.get(*k).and_then(Value::as_str))
+                                .any(|s| s.contains("image"))
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if text.is_empty() && images == 0 {
+                return None;
+            }
+            prompt_event(new_id(), session, &project, "cursor", Utc::now(), &PromptInfo::analyze(text, images))
+        }
+        "tool" => {
+            let tool = v.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
+            tool_event(new_id(), session, &project, "cursor", Utc::now(), tool)
+        }
+        "stop" => event(new_id(), session, &project, "cursor", Utc::now(), "stop"),
+        _ => return None,
+    };
+    enqueue(&[e])?;
+    if !flushing() {
+        spawn_flush();
+    }
+    Some(())
 }
 
 fn record() -> Option<()> {
@@ -178,9 +232,17 @@ fn new_id() -> String {
     format!("{:x}-{:x}", nanos, std::process::id())
 }
 
-/// Folder name of the git repo the session is in, or of the folder itself.
+/// Folder name of the git repo the session is in, or of the folder itself. The home
+/// folder is called "home", since its name is usually the person's real name and the
+/// profile is public.
 pub(crate) fn project_name(cwd: &str) -> String {
     let start = Path::new(cwd);
+    if cwd.is_empty() {
+        return "unknown".into();
+    }
+    if start == home() {
+        return "home".into();
+    }
     let mut d = Some(start);
     while let Some(p) = d {
         if p.join(".git").exists() {
@@ -435,13 +497,79 @@ fn hooks_installed(settings: &Path) -> bool {
         })
 }
 
+// ---------- Cursor hooks ----------
+
+const CURSOR_HOOKS: [(&str, &str); 3] = [("beforeSubmitPrompt", "prompt"), ("postToolUse", "tool"), ("stop", "stop")];
+
+fn cursor_dir() -> PathBuf {
+    home().join(".cursor")
+}
+
+fn is_ours_cursor(entry: &Value) -> bool {
+    entry
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|c| c.contains("steer") && c.contains(" hook cursor "))
+}
+
+/// Adds (or with `remove`, takes out) steer's entries in ~/.cursor/hooks.json, keeping
+/// everything else. Only done if Cursor is installed (~/.cursor exists).
+fn setup_cursor(file: &Path, remove: bool) -> Result<Option<String>, String> {
+    if !file.parent().is_some_and(Path::exists) {
+        return Ok(None);
+    }
+    let original = fs::read_to_string(file).ok();
+    let mut root: Value = match &original {
+        Some(text) if !text.trim().is_empty() => serde_json::from_str(text)
+            .map_err(|e| format!("{} isn't valid JSON ({e}), so it wasn't changed", file.display()))?,
+        _ => json!({ "version": 1 }),
+    };
+    let obj = root.as_object_mut().ok_or("~/.cursor/hooks.json isn't a JSON object, so it wasn't changed")?;
+    obj.entry("version").or_insert(1.into());
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    let hooks = hooks.as_object_mut().ok_or("\"hooks\" in ~/.cursor/hooks.json isn't an object")?;
+    let bin = dir().join("bin").join(if cfg!(windows) { "steer.exe" } else { "steer" });
+    for (event, which) in CURSOR_HOOKS {
+        let list = hooks.entry(event).or_insert_with(|| json!([]));
+        let Some(list) = list.as_array_mut() else { continue };
+        list.retain(|e| !is_ours_cursor(e));
+        if !remove {
+            list.push(json!({ "command": format!("\"{}\" hook cursor {which}", bin.display()) }));
+        }
+    }
+    hooks.retain(|_, v| !v.as_array().is_some_and(|a| a.is_empty()));
+    if let Some(text) = &original {
+        let backup = file.with_extension("json.steer-backup");
+        if !backup.exists() {
+            fs::write(&backup, text).map_err(|e| e.to_string())?;
+        }
+    }
+    fs::write(file, serde_json::to_string_pretty(&root).unwrap() + "\n").map_err(|e| e.to_string())?;
+    Ok(Some(if remove {
+        format!("took the steer hooks out of {}", file.display())
+    } else {
+        format!("added steer hooks to {}", file.display())
+    }))
+}
+
+fn cursor_hooks_installed() -> bool {
+    fs::read_to_string(cursor_dir().join("hooks.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .is_some_and(|v| {
+            CURSOR_HOOKS.iter().all(|(event, _)| {
+                v.pointer(&format!("/hooks/{event}")).and_then(Value::as_array).is_some_and(|l| l.iter().any(is_ours_cursor))
+            })
+        })
+}
+
 // ---------- commands ----------
 
 pub const HELP: &str = "live tracking:
   steer signup NAME [--server URL]   make an account and save its key
   steer login KEY [--server URL]     use an account you already have
-  steer setup                        hook into Claude Code and start the watcher for
-                                     Codex and OpenCode at login
+  steer setup                        hook into Claude Code and Cursor, and start the
+                                     watcher for Codex, OpenCode and Copilot at login
   steer setup --remove               undo all of that
   steer status                       show what's set up and what's waiting to send
   steer watch --dry-run [--days N]   show what the watcher would send, as counts
@@ -479,7 +607,11 @@ pub fn command(args: &[String]) -> i32 {
                 if custom.is_some() || args.iter().any(|a| a == "--no-watch") {
                     return Ok(hooks);
                 }
-                crate::watch::autostart(remove).map(|w| format!("{hooks}\n{w}"))
+                let mut msg = hooks;
+                if let Some(c) = setup_cursor(&cursor_dir().join("hooks.json"), remove)? {
+                    msg += &format!("\n{c}");
+                }
+                crate::watch::autostart(remove).map(|w| format!("{msg}\n{w}"))
             })
         }
         "status" => Ok(status()),
@@ -538,7 +670,17 @@ fn status() -> String {
         if hooks_installed(&settings) { "on" } else { "off, run steer setup" }
     );
     out += &format!(
-        "watcher for codex and opencode: {}\n",
+        "cursor hooks: {}\n",
+        if !cursor_dir().exists() {
+            "cursor isn't installed"
+        } else if cursor_hooks_installed() {
+            "on"
+        } else {
+            "off, run steer setup"
+        }
+    );
+    out += &format!(
+        "watcher for codex, opencode and copilot: {}\n",
         if crate::watch::running() { "running" } else { "not running, run steer setup" }
     );
     out += &format!("waiting to send: {} events", queued());
@@ -573,6 +715,30 @@ mod tests {
         assert_eq!(saved.len(), SAVED_SESSIONS);
         assert!(saved.contains_key("aaa"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cursor_setup_keeps_other_hooks_and_skips_when_not_installed() {
+        let tmp = std::env::temp_dir().join(format!("steer-cursor-{}", new_id()));
+        let file = tmp.join(".cursor").join("hooks.json");
+        // No ~/.cursor: nothing is created.
+        assert_eq!(setup_cursor(&file, false).unwrap(), None);
+        assert!(!file.exists());
+
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let theirs = json!({ "version": 1, "hooks": { "stop": [{ "command": "say done" }] } });
+        fs::write(&file, theirs.to_string()).unwrap();
+        setup_cursor(&file, false).unwrap();
+        setup_cursor(&file, false).unwrap(); // twice doesn't add twice
+        let v: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["stop"].as_array().unwrap().len(), 2);
+        assert!(v["hooks"]["beforeSubmitPrompt"][0]["command"].as_str().unwrap().ends_with(" hook cursor prompt"));
+
+        setup_cursor(&file, true).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["stop"], json!([{ "command": "say done" }]));
+        assert!(v["hooks"].get("beforeSubmitPrompt").is_none());
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

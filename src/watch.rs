@@ -3,7 +3,7 @@
 //! few seconds, same as the Claude Code hook. `steer setup` makes it start at login.
 
 use crate::live::{self, dir, enqueue, load_config};
-use crate::{codex, opencode};
+use crate::{codex, copilot, opencode};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::fs;
@@ -65,23 +65,27 @@ pub fn run() -> i32 {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let first_run = !state.contains_key("codex");
+    // Per tool: the first time a tool is watched, its existing files are skipped so old
+    // history isn't sent. Files that show up after that are read from the start.
+    let mut skip_codex = !state.contains_key("codex");
+    let mut skip_copilot = !state.contains_key("copilot");
     let mut sent = HashSet::new();
-    let mut skip_existing = first_run;
 
     loop {
         let _ = fs::write(lock_path(), std::process::id().to_string());
         let mut events = Vec::new();
 
-        let codex_state = state.entry("codex").or_insert_with(|| json!({}));
-        if let Some(s) = codex_state.as_object_mut() {
-            events.extend(codex::poll(s, skip_existing));
+        if let Some(s) = state.entry("codex").or_insert_with(|| json!({})).as_object_mut() {
+            events.extend(codex::poll(s, skip_codex));
         }
-        let oc_state = state.entry("opencode").or_insert_with(|| json!({}));
-        if let Some(s) = oc_state.as_object_mut() {
+        if let Some(s) = state.entry("copilot").or_insert_with(|| json!({})).as_object_mut() {
+            events.extend(copilot::poll(s, skip_copilot));
+        }
+        if let Some(s) = state.entry("opencode").or_insert_with(|| json!({})).as_object_mut() {
             events.extend(opencode::poll(s, &mut sent));
         }
-        skip_existing = false;
+        skip_codex = false;
+        skip_copilot = false;
 
         let _ = enqueue(&events);
         let _ = fs::write(state_path(), Value::Object(state.clone()).to_string());
@@ -106,6 +110,8 @@ pub fn dry_run(days: i64) -> String {
         e["t"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).is_some_and(|t| t > cutoff)
     };
     out += &summary("codex", codex_events.iter().filter(recent).collect());
+    let copilot_events = copilot::poll(&mut Map::new(), false);
+    out += &summary("copilot", copilot_events.iter().filter(recent).collect());
 
     let mut oc_state = Map::new();
     oc_state.insert("cursor".into(), cutoff.timestamp_millis().into());
@@ -180,7 +186,7 @@ pub fn autostart(remove: bool) -> Result<String, String> {
         if !out.status.success() {
             return Err(format!("launchctl said: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
-        Ok(format!("the watcher (for codex and opencode) now starts at login: {}", plist.display()))
+        Ok(format!("the watcher (for codex, opencode and copilot) now starts at login: {}", plist.display()))
     } else if cfg!(target_os = "linux") {
         let unit = live::home().join(".config/systemd/user/steer-watch.service");
         if remove {

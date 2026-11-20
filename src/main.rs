@@ -1,5 +1,6 @@
 mod analyze;
 mod codex;
+mod copilot;
 mod claude;
 mod git;
 mod live;
@@ -7,6 +8,7 @@ mod model;
 mod opencode;
 mod prompt;
 mod report;
+mod tail;
 mod watch;
 
 use chrono::{DateTime, Utc};
@@ -62,7 +64,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
-        Some("hook") => return live::hook(),
+        Some("hook") => return live::hook(&argv[1..]),
         Some("signup" | "login" | "setup" | "status" | "flush") => std::process::exit(live::command(&argv)),
         Some("watch") => {
             if argv.iter().any(|a| a == "--dry-run") {
