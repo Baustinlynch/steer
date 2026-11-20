@@ -7,7 +7,7 @@ import { createReadStream, readdirSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { SessionReader, buildReport, fmtDur, projectAgent, projectFlagged, projectHuman } from "../web/steer.js";
+import { SessionReader, buildReport, fmtDur, projectAgent, projectFlagged, projectHuman, projectOverlap } from "../web/steer.js";
 
 const root = process.argv[2] ?? join(homedir(), ".claude", "projects");
 const days = process.argv[3] === "all" ? null : Number(process.argv[3] ?? 30);
@@ -35,3 +35,4 @@ console.log(`  your time            ${fmtDur(total(projectHuman))}`);
 console.log(`  agent time           ${fmtDur(agent)}`);
 console.log(`  1/3 rule             ${fmtDur(Math.trunc(agent / 3))}`);
 console.log(`  dark flow (ignored)  ${fmtDur(total(projectFlagged))}`);
+console.log(`  overlap (once)       ${fmtDur(total(projectOverlap))}`);

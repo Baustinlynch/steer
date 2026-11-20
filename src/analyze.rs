@@ -28,6 +28,11 @@ const BREAK_BACK_TESTED: i64 = 300;
 pub const LOOP_GAP: i64 = 900;
 /// How many in a row before it's flagged.
 const LOOP_MIN: usize = 3;
+/// Most a prompt counts when there's nothing before it to measure from: the first one in
+/// a session, or one right after a prompt the agent never answered.
+pub const FIRST_PROMPT_MAX: i64 = 120;
+/// Most a prompt in a dark-flow loop keeps.
+pub const DARK_FLOW_KEEP: i64 = 30;
 
 pub const TOOL_GROUPS: [&str; 7] = ["edit", "command", "read", "browser action", "web search", "subagent", "other call"];
 
@@ -54,6 +59,9 @@ pub enum Why {
     Typing { gap: i64, watch: i64 },
     /// Prompt cut down to the time since your last action.
     Wall { wall: i64 },
+    /// Prompt right after a prompt the agent never answered: only typing counts, like a
+    /// first prompt.
+    NoReply { wall: i64 },
     /// Any other action: `secs` kept between `min` and `max`.
     Clamped { secs: i64, min: i64, max: i64 },
 }
@@ -81,6 +89,9 @@ pub struct Turn {
     pub typed: i64,
     /// For dark flow: how many prompts were in the run.
     pub run: usize,
+    /// Time that another session running at the same moment already counted, so it
+    /// isn't counted again here. Set by `count_overlap_once`.
+    pub overlap_secs: i64,
 }
 
 pub struct SessionReport {
@@ -98,6 +109,9 @@ impl SessionReport {
     }
     pub fn flagged_secs(&self) -> i64 {
         self.turns.iter().map(|t| t.flagged_secs).sum()
+    }
+    pub fn overlap_secs(&self) -> i64 {
+        self.turns.iter().map(|t| t.overlap_secs).sum()
     }
 }
 
@@ -178,6 +192,7 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
         let mut is_loopy = false;
         let mut typed = 0;
         let mut from_agent = prev.is_some_and(|p| p.3);
+        let after_prompt = k > 0 && matches!(ev[humans[k - 1]].kind, EventKind::Prompt(_));
 
         let (kind, words, human_secs, why) = match &e.kind {
             EventKind::Prompt(p) => {
@@ -202,8 +217,13 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
                 }
 
                 typed = p.typing_secs();
+                // Every prompt is capped at the time since your last action, so pasting
+                // long prompts back to back can't count more than the time that passed.
                 let (secs, why) = match prev {
-                    None => (typed, Why::First),
+                    None => (typed.min(FIRST_PROMPT_MAX), Why::First),
+                    // The agent never answered the last prompt, so there was nothing to
+                    // review or test: only typing counts.
+                    Some((_, _, wall, false)) if after_prompt => (typed.min(FIRST_PROMPT_MAX).min(wall), Why::NoReply { wall }),
                     Some((gap, agent_prev, wall, _)) => {
                         let cap = if p.generic {
                             LOW_INFO_CAP
@@ -214,15 +234,16 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
                         };
                         if gap > cap {
                             let back = if tested { BREAK_BACK_TESTED } else { BREAK_BACK };
-                            ((typed + back).min(cap.max(typed)), Why::Break { gap, cap, back })
+                            ((typed + back).min(cap.max(typed)).min(wall), Why::Break { gap, cap, back })
                         } else {
                             let watch = if gap <= WATCH_WINDOW { agent_prev.min(WATCH_WINDOW) } else { 0 };
                             let reply = gap + watch;
-                            let secs = reply.max(typed).min(wall.max(typed));
-                            let why = if secs == typed && typed != reply {
-                                Why::Typing { gap, watch }
-                            } else if secs < reply {
+                            let want = reply.max(typed);
+                            let secs = want.min(wall);
+                            let why = if secs < want {
                                 Why::Wall { wall }
+                            } else if typed > reply {
+                                Why::Typing { gap, watch }
                             } else {
                                 Why::Reply { gap, watch, cap }
                             };
@@ -275,6 +296,7 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
             from_agent,
             typed,
             run: 0,
+            overlap_secs: 0,
         });
         loopy.push(is_loopy);
         typing.push(typed);
@@ -313,7 +335,7 @@ fn mark_dark_flow(turns: &mut [Turn], loopy: &[bool], typing: &[i64]) {
         if b - a + 1 >= LOOP_MIN {
             for &i in &prompts[a..=b] {
                 let t = &mut turns[i];
-                let keep = typing[i].min(t.human_secs);
+                let keep = typing[i].min(DARK_FLOW_KEEP).min(t.human_secs);
                 t.flagged_secs = t.human_secs - keep;
                 t.human_secs = keep;
                 t.dark_flow = true;
@@ -321,6 +343,38 @@ fn mark_dark_flow(turns: &mut [Turn], loopy: &[bool], typing: &[i64]) {
             }
         }
         a = b + 1;
+    }
+}
+
+/// Several sessions at once (two windows, two tools, two computers) would each count the
+/// same minutes. A turn's time covers the stretch right before it, so going through every
+/// turn of every session in time order, only the part of that stretch that no earlier
+/// turn already covered counts. The rest moves to `overlap_secs`. Works in milliseconds,
+/// like web/steer.js, so both give the same totals.
+pub fn count_overlap_once<'a>(turns: impl IntoIterator<Item = &'a mut Turn>) {
+    let mut all: Vec<&mut Turn> = turns.into_iter().filter(|t| t.human_secs > 0).collect();
+    all.sort_by_key(|t| t.t);
+    // Covered stretches, merged and in order. Every one ends at or before the turn being
+    // looked at, since turns go in time order.
+    let mut covered: Vec<(i64, i64)> = Vec::new();
+    for turn in all {
+        let end = turn.t.timestamp_millis();
+        let start = end - turn.human_secs * 1000;
+        let mut already = 0;
+        for &(a, b) in covered.iter().rev() {
+            if b <= start {
+                break;
+            }
+            already += b - a.max(start);
+        }
+        let fresh = (end - start - already) / 1000;
+        turn.overlap_secs = turn.human_secs - fresh;
+        turn.human_secs = fresh;
+        let mut merged_start = start;
+        while covered.last().is_some_and(|&(_, b)| b >= start) {
+            merged_start = merged_start.min(covered.pop().unwrap().0);
+        }
+        covered.push((merged_start, end));
     }
 }
 
@@ -340,6 +394,49 @@ mod tests {
     }
     fn run(events: Vec<Event>) -> SessionReport {
         analyze(&Session { cwd: None, title: None, events }, &[])
+    }
+
+    fn long(t: DateTime<Utc>) -> Event {
+        // 1300 characters: typing it would take the full 5 min
+        prompt(t, &"make the enemy in wave.rs dodge left when the player shoots at it ".repeat(20))
+    }
+
+    #[test]
+    fn pasting_fast_counts_no_more_than_the_real_time() {
+        let mut ev = vec![long(at(0, 0)), agent(at(0, 1))];
+        for s in (2..=30).step_by(2) {
+            ev.push(long(at(0, s)));
+            ev.push(agent(at(0, s + 1)));
+        }
+        let r = run(ev);
+        assert!(r.human_secs() <= 31 + FIRST_PROMPT_MAX, "got {}", r.human_secs());
+    }
+
+    #[test]
+    fn unanswered_prompts_only_count_typing() {
+        let ev: Vec<Event> = (0..10).map(|k| long(at(k * 10, 0))).collect();
+        let r = run(ev);
+        assert!(r.turns.iter().all(|t| t.human_secs <= FIRST_PROMPT_MAX));
+        assert!(matches!(r.turns[1].why, Why::NoReply { .. }));
+    }
+
+    #[test]
+    fn parallel_sessions_count_once() {
+        let one = || {
+            let mut ev = Vec::new();
+            for k in 0..6 {
+                ev.push(prompt(at(k * 14, 0), "add a pause menu to the game with resume and quit buttons"));
+                for a in 1..=5 {
+                    ev.push(agent(at(k * 14 + a, 0)));
+                }
+            }
+            run(ev)
+        };
+        let alone = one().human_secs();
+        let mut four = [one(), one(), one(), one()];
+        count_overlap_once(four.iter_mut().flat_map(|s| s.turns.iter_mut()));
+        assert_eq!(four.iter().map(SessionReport::human_secs).sum::<i64>(), alone);
+        assert_eq!(four.iter().map(SessionReport::overlap_secs).sum::<i64>(), 3 * alone);
     }
 
     #[test]

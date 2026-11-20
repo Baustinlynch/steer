@@ -164,6 +164,7 @@ fn report(argv: &[String]) {
     }
 
     let mut projects: Vec<report::Project> = by_name.into_values().collect();
+    analyze::count_overlap_once(projects.iter_mut().flat_map(|p| p.sessions.iter_mut()).flat_map(|s| s.turns.iter_mut()));
     for p in &mut projects {
         p.sessions.sort_by_key(|s| std::cmp::Reverse(s.start));
     }
@@ -183,12 +184,14 @@ fn report(argv: &[String]) {
     let human: i64 = projects.iter().map(report::Project::human_secs).sum();
     let agent: i64 = projects.iter().map(report::Project::agent_secs).sum();
     let flagged: i64 = projects.iter().map(report::Project::flagged_secs).sum();
+    let overlap: i64 = projects.iter().map(report::Project::overlap_secs).sum();
     let sessions: usize = projects.iter().map(|p| p.sessions.len()).sum();
     println!("{sessions} sessions in {} projects, {window}", projects.len());
     println!("  your time            {}", report::fmt_dur(human));
     println!("  agent time           {}", report::fmt_dur(agent));
     println!("  1/3 rule             {}", report::fmt_dur(agent / 3));
     println!("  dark flow (ignored)  {}", report::fmt_dur(flagged));
+    println!("  overlap (once)       {}", report::fmt_dur(overlap));
     let shown = std::fs::canonicalize(&args.out).unwrap_or(args.out);
     println!("report: {}", shown.display());
 }

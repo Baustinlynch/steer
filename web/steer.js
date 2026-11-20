@@ -214,6 +214,8 @@ const BREAK_BACK = 120;
 const BREAK_BACK_TESTED = 300;
 const LOOP_GAP = 900;
 const LOOP_MIN = 3;
+const FIRST_PROMPT_MAX = 120;
+const DARK_FLOW_KEEP = 30;
 
 export const TOOL_GROUPS = ["edit", "command", "read", "browser action", "web search", "subagent", "other call"];
 
@@ -280,6 +282,7 @@ export function analyzeSession(session) {
     let human;
     let why;
     let fromAgent = prev !== null && prev.fromAgent;
+    const afterPrompt = k > 0 && ev[humans[k - 1]].kind === "prompt";
     let words = 0;
 
     switch (e.kind) {
@@ -297,22 +300,29 @@ export function analyzeSession(session) {
         if (repeat) tags.push("repeat");
 
         typed = typingSecs(p);
+        // Every prompt is capped at the time since your last action, so pasting long
+        // prompts back to back can't count more than the time that passed.
         if (!prev) {
-          human = typed;
+          human = Math.min(typed, FIRST_PROMPT_MAX);
           why = { rule: "first" };
+        } else if (afterPrompt && !prev.fromAgent) {
+          // The agent never answered the last prompt, so only typing counts.
+          human = Math.min(typed, FIRST_PROMPT_MAX, prev.wall);
+          why = { rule: "noreply", wall: prev.wall };
         } else {
           const { gap, wall } = prev;
           const cap = p.generic ? LOW_INFO_CAP : tested ? TESTED_CAP : REVIEW_CAP;
           if (gap > cap) {
             const back = tested ? BREAK_BACK_TESTED : BREAK_BACK;
-            human = Math.min(typed + back, Math.max(cap, typed));
+            human = Math.min(typed + back, Math.max(cap, typed), wall);
             why = { rule: "break", gap, cap, back };
           } else {
             const watch = gap <= WATCH_WINDOW ? Math.min(prev.agentPrev, WATCH_WINDOW) : 0;
             const reply = gap + watch;
-            human = Math.min(Math.max(reply, typed), Math.max(wall, typed));
-            if (human === typed && typed !== reply) why = { rule: "typing", gap, watch };
-            else if (human < reply) why = { rule: "wall", wall };
+            const want = Math.max(reply, typed);
+            human = Math.min(want, wall);
+            if (human < want) why = { rule: "wall", wall };
+            else if (typed > reply) why = { rule: "typing", gap, watch };
             else why = { rule: "reply", gap, watch, cap };
           }
         }
@@ -354,6 +364,8 @@ export function analyzeSession(session) {
       fromAgent,
       typed,
       run: 0,
+      // Time another session at the same moment already counted. Set by countOverlapOnce.
+      overlap: 0,
     });
     loopy.push(isLoopy);
     typing.push(typed);
@@ -386,7 +398,7 @@ function markDarkFlow(turns, loopy, typing) {
     if (b - a + 1 >= LOOP_MIN) {
       for (const i of prompts.slice(a, b + 1)) {
         const t = turns[i];
-        const keep = Math.min(typing[i], t.human);
+        const keep = Math.min(typing[i], DARK_FLOW_KEEP, t.human);
         t.flagged = t.human - keep;
         t.human = keep;
         t.darkFlow = true;
@@ -400,10 +412,37 @@ function markDarkFlow(turns, loopy, typing) {
 export const sessionHuman = (s) => s.turns.reduce((n, t) => n + t.human, 0);
 export const sessionAgent = (s) => s.turns.reduce((n, t) => n + t.agent, 0);
 export const sessionFlagged = (s) => s.turns.reduce((n, t) => n + t.flagged, 0);
+export const sessionOverlap = (s) => s.turns.reduce((n, t) => n + t.overlap, 0);
 const sum = (xs, f) => xs.reduce((n, x) => n + f(x), 0);
 export const projectHuman = (p) => sum(p.sessions, sessionHuman);
 export const projectAgent = (p) => sum(p.sessions, sessionAgent);
 export const projectFlagged = (p) => sum(p.sessions, sessionFlagged);
+export const projectOverlap = (p) => sum(p.sessions, sessionOverlap);
+
+/**
+ * Several sessions at once (two windows, two tools, two computers) would each count the
+ * same minutes. A turn's time covers the stretch right before it, so going through every
+ * turn of every session in time order, only the part no earlier turn already covered
+ * counts. The rest moves to `overlap`. Same as count_overlap_once in src/analyze.rs.
+ */
+export function countOverlapOnce(turns) {
+  const all = turns.filter((t) => t.human > 0).sort((a, b) => a.t - b.t);
+  const covered = []; // [start, end] in ms, merged and in order
+  for (const turn of all) {
+    const end = turn.t;
+    const start = end - turn.human * 1000;
+    let already = 0;
+    for (let i = covered.length - 1; i >= 0 && covered[i][1] > start; i--) {
+      already += covered[i][1] - Math.max(covered[i][0], start);
+    }
+    const fresh = Math.floor((end - start - already) / 1000);
+    turn.overlap = turn.human - fresh;
+    turn.human = fresh;
+    let mergedStart = start;
+    while (covered.length && covered[covered.length - 1][1] >= start) mergedStart = Math.min(mergedStart, covered.pop()[0]);
+    covered.push([mergedStart, end]);
+  }
+}
 
 // Same order as Rust sorting PathBufs: compare folder by folder.
 function comparePaths(a, b) {
@@ -446,6 +485,7 @@ export function buildReport(sessions, { days = 30, now = Date.now() } = {}) {
   }
 
   const projects = [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  countOverlapOnce(projects.flatMap((p) => p.sessions.flatMap((s) => s.turns)));
   for (const p of projects) p.sessions.sort((a, b) => b.start - a.start);
   projects.sort((a, b) => projectHuman(b) - projectHuman(a));
   return projects;
@@ -487,6 +527,7 @@ export function renderReport(
   const human = sum(projects, projectHuman);
   const agent = sum(projects, projectAgent);
   const flagged = sum(projects, projectFlagged);
+  const overlap = sum(projects, projectOverlap);
   const sessions = sum(projects, (p) => p.sessions.length);
   let h = "";
 
@@ -497,6 +538,7 @@ export function renderReport(
 <tr><th>Agent time</th><td>${fmtDur(agent)}</td></tr>
 <tr><th>1/3 rule</th><td>${fmtDur(Math.trunc(agent / 3))}</td></tr>
 <tr><th>Dark flow (not counted)</th><td>${fmtDur(flagged)}</td></tr>
+<tr><th>Sessions at the same time (counted once)</th><td>${fmtDur(overlap)}</td></tr>
 </table>
 `;
 
@@ -543,7 +585,8 @@ function renderSession(s, hideTitles) {
     const when = dayKey(d) === startDay ? hm(d) : fullDate(d);
     const action = t.kind === "prompt" ? `Prompt (${plural(t.words, "word")})` : ACTIONS[t.kind];
     const note = turnNote(t);
-    const you = t.darkFlow && t.flagged > 0 ? `${fmtDur(t.human)} (was ${fmtDur(t.human + t.flagged)})` : fmtDur(t.human);
+    const before = t.human + t.flagged + t.overlap;
+    const you = before !== t.human ? `${fmtDur(t.human)} (was ${fmtDur(before)})` : fmtDur(t.human);
     const did = TOOL_GROUPS.map((g, i) => [g, t.tools[i]]).filter(([, n]) => n > 0).map(([g, n]) => plural(n, g));
     h += `<tr${t.darkFlow ? ' class="flow"' : ""}><td>${when}</td><td>${action}</td><td title="${esc(note.long)}">${note.short}</td><td class="r">${you}</td><td class="r">${t.agent > 0 ? fmtDur(t.agent) : ""}</td><td>${did.join(", ")}</td></tr>\n`;
   }
@@ -586,8 +629,8 @@ function testedHow(t) {
  * hovering over it (plain text). src/report.rs has the same words in note().
  */
 export function turnNote(t) {
-  // Time before dark flow cut it down.
-  const base = t.human + t.flagged;
+  // Time before dark flow or another session cut it down.
+  const base = t.human + t.flagged + t.overlap;
   const since = t.fromAgent ? "after the agent stopped" : "after your last action";
   const shortPrompt = t.tags.includes("low info");
   const tested = testedHow(t);
@@ -602,7 +645,10 @@ export function turnNote(t) {
 
   if (w.rule === "first" && t.kind === "prompt") {
     short = "first prompt, just typing time";
-    long = `nothing before it to measure from, so only typing time counts (${exact(t.typed)}).`;
+    long = `nothing before it to measure from, so only typing time counts (${exact(t.typed)}), up to ${exact(FIRST_PROMPT_MAX)}.`;
+  } else if (w.rule === "noreply") {
+    short = "no reply to your last prompt, just typing time";
+    long = `the agent didn't answer your last prompt, so there was nothing to read or test. only typing time counts (${exact(t.typed)}), up to ${exact(FIRST_PROMPT_MAX)} and never more than the ${exact(w.wall)} since your last prompt.`;
   } else if (w.rule === "first") {
     short = `first action, counts ${ago(base)}`;
     long = `nothing before it to measure from, so it gets a flat ${exact(base)}.`;
@@ -633,7 +679,7 @@ export function turnNote(t) {
     long = `you replied ${exact(w.gap)} ${since}${w.watch > 0 ? ` (+${exact(w.watch)} watching)` : ""}, but typing it takes about ${exact(t.typed)}, so typing time counts.`;
   } else if (w.rule === "wall") {
     short = `${ago(w.wall)} since your last action`;
-    long = "it can't count more than the time since your last action.";
+    long = "a prompt never counts more than the time since your last action.";
   } else {
     const asked = t.kind === "rejected" && t.fromAgent;
     const after = asked ? "after the agent asked" : since;
@@ -653,7 +699,11 @@ export function turnNote(t) {
   if (t.darkFlow) {
     const was = t.flagged > 0 ? ` it would have been ${exact(base)}: ${short}.` : "";
     short = `<span class="red">dark flow</span>: ${shortPrompt ? "short" : "repeat"} prompt in a run of ${t.run}, typing only`;
-    long = `${t.run} short or repeat prompts in a row, each within ${exact(LOOP_GAP)} of the last, and none show testing. that looks like hitting retry, so only typing time counts (${exact(t.typed)}).${was}`;
+    long = `${t.run} short or repeat prompts in a row, each within ${exact(LOOP_GAP)} of the last, and none show testing. that looks like hitting retry, so only typing time counts, up to ${exact(DARK_FLOW_KEEP)}.${was}`;
+  }
+  if (t.overlap > 0) {
+    short += ", overlaps another session";
+    long += `\nanother session was already counting ${exact(t.overlap)} of this same time, so that part counts there and not here.`;
   }
   if (t.kind === "prompt" && t.tags.length > 0) long += `\nprompt: ${t.tags.map((g) => TAG_WORDS[g] ?? g).join(", ")}`;
   return { short, long };
@@ -666,9 +716,11 @@ const HOW = `<h2>How it counts</h2>
 <li>A longer gap is a break. Then only 2 min plus typing time counts (5 min if you tested something). Short prompts get 2 min at most.</li>
 <li>If you reply within 2 min of the agent finishing, up to 2 min of agent time counts too.</li>
 <li>Typing time is guessed from how long the prompt is, about 48 words a minute, between 5s and 5 min.</li>
+<li>A prompt never counts more than the time since your last action. The first prompt of a session, or one right after a prompt the agent never answered, only counts typing time, up to 2 min.</li>
 <li>Stopping the agent counts the time since your last action, up to 5 min. A command you run counts up to 5 min, a slash command up to 30s and a rejected tool call up to 1 min.</li>
 <li>Agent time never counts as your time.</li>
-<li>3 or more short or repeated prompts in a row, each within 15 min of the last and without testing, is dark flow. Only typing time counts for those.</li>
+<li>3 or more short or repeated prompts in a row, each within 15 min of the last and without testing, is dark flow. Only typing time counts for those, up to 30s each.</li>
+<li>Sessions running at the same time (two windows, two tools or two computers) only count the same minutes once.</li>
 <li>If a session was resumed or forked, the copied messages only count once.</li>
 <li>The notes say why each row got its time. Hover over a note for the numbers.</li>
 <li>Prompts are only used for word counts and notes. The text isn't saved.</li>

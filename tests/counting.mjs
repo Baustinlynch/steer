@@ -1,0 +1,86 @@
+// Replays the ways people tried to get time they didn't earn (from the red team on
+// 2026-11-20) against the counting code the server and the website use, and checks an
+// honest session still counts normally:
+//   node tests/counting.mjs
+
+import assert from "node:assert/strict";
+import { buildReport, projectHuman, projectOverlap } from "../web/steer.js";
+
+const T0 = Date.UTC(2026, 10, 20, 15, 0, 0);
+const sec = (s) => T0 + s * 1000;
+let ids = 0;
+const prompt = (s, chars, extra = {}) => ({
+  id: `e${ids++}`,
+  t: sec(s),
+  kind: "prompt",
+  prompt: { words: Math.round(chars / 5), chars, images: 0, specific: 2, observation: false, generic: false, repeat: false, ...extra },
+});
+const agent = (s, tools = ["Edit"]) => ({ id: `e${ids++}`, t: sec(s), kind: "agent", tools });
+const session = (name, events, project = "game") => ({ path: `p/${name}.jsonl`, cwd: `/home/x/${project}`, title: null, events });
+const total = (sessions) => buildReport(sessions, { days: null, now: sec(10 * 86400) }).reduce((n, p) => n + projectHuman(p), 0);
+
+// 1. 1000 long prompts sent at the same moment used to count 5 min each (83 hours).
+{
+  const events = [];
+  for (let i = 0; i < 1000; i++) events.push(prompt(0, 1300));
+  assert.ok(total([session("burst", events)]) <= 120, "a burst of prompts can't count more than the time that passed");
+}
+
+// 2. The same burst spread over 1000 separate sessions.
+{
+  const sessions = [];
+  for (let i = 0; i < 1000; i++) sessions.push(session(`fan${i}`, [prompt(0, 1300), agent(5)]));
+  assert.ok(total(sessions) <= 120, "1000 sessions at once count the same minutes once");
+}
+
+// 3. Pasting a long prompt every second for 30 s used to count 5 min each.
+{
+  const events = [prompt(0, 1300), agent(1)];
+  for (let s = 2; s <= 30; s += 2) events.push(prompt(s, 1300), agent(s + 1));
+  assert.ok(total([session("paste", events)]) <= 31 + 120, "pasting fast counts no more than the real time");
+}
+
+// 4. Prompts only, no agent ever answering, one every 10 min for a day.
+{
+  const events = [];
+  for (let s = 0; s < 86400; s += 600) events.push(prompt(s, 1300));
+  assert.ok(total([session("lazy", events)]) <= 144 * 120, "unanswered prompts only count typing time");
+}
+
+// 5. The same honest work in 4 parallel sessions counts once.
+const honest = () => {
+  const events = [];
+  for (let k = 0; k < 6; k++) {
+    const s = k * 840;
+    events.push(prompt(s, 300));
+    for (let a = 10; a <= 300; a += 30) events.push(agent(s + a));
+  }
+  return events;
+};
+{
+  const one = total([session("solo", honest())]);
+  const four = buildReport(["a", "b", "c", "d"].map((n) => session(n, honest(), `proj-${n}`)), { days: null, now: sec(10 * 86400) });
+  assert.equal(four.reduce((n, p) => n + projectHuman(p), 0), one, "parallel sessions count once");
+  assert.ok(four.reduce((n, p) => n + projectOverlap(p), 0) >= 3 * one - 10, "the rest shows up as overlap");
+}
+
+// 6. Dark flow: a run of short "continue"s keeps at most 30s each.
+{
+  const events = [];
+  for (let k = 0; k < 6; k++) {
+    events.push(prompt(k * 60, 1300, { generic: true, specific: 0 }));
+    events.push(agent(k * 60 + 30));
+  }
+  const p = buildReport([session("loop", events)], { days: null, now: sec(10 * 86400) })[0];
+  for (const t of p.sessions[0].turns.slice(1)) assert.ok(t.human <= 30, `dark flow kept ${t.human}s`);
+}
+
+// 7. An honest session still counts what it should: 6 prompts 14 min apart, the agent
+// works about 5 min after each and you read and test for the 560 s after that.
+{
+  const r = total([session("normal", honest())]);
+  // first prompt: 75 s of typing, then 5 replies of 560 s each
+  assert.equal(r, 75 + 5 * 560, `honest session counted ${r}s`);
+}
+
+console.log("counting tests passed");

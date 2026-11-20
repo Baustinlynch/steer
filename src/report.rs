@@ -1,7 +1,8 @@
 //! Builds the HTML report. Prompt text never gets here.
 
 use crate::analyze::{
-    SessionReport, Turn, TurnKind, Why, LOOP_GAP, LOW_INFO_CAP, REVIEW_CAP, TESTED_CAP, TOOL_GROUPS, WATCH_WINDOW,
+    SessionReport, Turn, TurnKind, Why, DARK_FLOW_KEEP, FIRST_PROMPT_MAX, LOOP_GAP, LOW_INFO_CAP, REVIEW_CAP, TESTED_CAP,
+    TOOL_GROUPS, WATCH_WINDOW,
 };
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use std::fmt::Write;
@@ -23,6 +24,9 @@ impl Project {
     }
     pub fn flagged_secs(&self) -> i64 {
         self.sessions.iter().map(SessionReport::flagged_secs).sum()
+    }
+    pub fn overlap_secs(&self) -> i64 {
+        self.sessions.iter().map(SessionReport::overlap_secs).sum()
     }
 }
 
@@ -73,6 +77,7 @@ pub fn render(projects: &[Project], opts: &Options) -> String {
     let human: i64 = projects.iter().map(Project::human_secs).sum();
     let agent: i64 = projects.iter().map(Project::agent_secs).sum();
     let flagged: i64 = projects.iter().map(Project::flagged_secs).sum();
+    let overlap: i64 = projects.iter().map(Project::overlap_secs).sum();
     let sessions: usize = projects.iter().map(|p| p.sessions.len()).sum();
 
     let mut h = String::with_capacity(256 * 1024);
@@ -86,6 +91,7 @@ pub fn render(projects: &[Project], opts: &Options) -> String {
 <tr><th>Agent time</th><td>{agent}</td></tr>
 <tr><th>1/3 rule</th><td>{rule}</td></tr>
 <tr><th>Dark flow (not counted)</th><td>{flow}</td></tr>
+<tr><th>Sessions at the same time (counted once)</th><td>{overlap}</td></tr>
 </table>
 "#,
         sessions = plural(sessions, "session"),
@@ -95,6 +101,7 @@ pub fn render(projects: &[Project], opts: &Options) -> String {
         agent = fmt_dur(agent),
         rule = fmt_dur(agent / 3),
         flow = fmt_dur(flagged),
+        overlap = fmt_dur(overlap),
     );
 
     let scale = projects.iter().map(|p| p.human_secs().max(p.agent_secs())).max().unwrap_or(1).max(1);
@@ -197,8 +204,9 @@ fn render_turn(h: &mut String, t: &Turn, start_day: NaiveDate) {
         let _ = write!(more, "\n{} before your next action.", plural(t.commits, "commit"));
     }
 
-    let you = if t.dark_flow && t.flagged_secs > 0 {
-        format!("{} (was {})", fmt_dur(t.human_secs), fmt_dur(t.human_secs + t.flagged_secs))
+    let before = t.human_secs + t.flagged_secs + t.overlap_secs;
+    let you = if before != t.human_secs {
+        format!("{} (was {})", fmt_dur(t.human_secs), fmt_dur(before))
     } else {
         fmt_dur(t.human_secs)
     };
@@ -268,8 +276,8 @@ fn tested_how(t: &Turn) -> Option<&'static str> {
 /// Why a turn got the time it did: a short line for the notes column (HTML), and more
 /// detail for hovering over it (plain text). web/steer.js has the same words in turnNote.
 pub fn note(t: &Turn) -> (String, String) {
-    // Time before dark flow cut it down.
-    let base = t.human_secs + t.flagged_secs;
+    // Time before dark flow or another session cut it down.
+    let base = t.human_secs + t.flagged_secs + t.overlap_secs;
     let since = if t.from_agent { "after the agent stopped" } else { "after your last action" };
     let short_prompt = t.tags.contains(&"low info");
     let tested = tested_how(t);
@@ -282,7 +290,20 @@ pub fn note(t: &Turn) -> (String, String) {
     let (mut short, mut long) = match (t.kind, t.why) {
         (TurnKind::Prompt, Why::First) => (
             "first prompt, just typing time".to_string(),
-            format!("nothing before it to measure from, so only typing time counts ({}).", exact(t.typed)),
+            format!(
+                "nothing before it to measure from, so only typing time counts ({}), up to {}.",
+                exact(t.typed),
+                exact(FIRST_PROMPT_MAX)
+            ),
+        ),
+        (_, Why::NoReply { wall }) => (
+            "no reply to your last prompt, just typing time".to_string(),
+            format!(
+                "the agent didn't answer your last prompt, so there was nothing to read or test. only typing time counts ({}), up to {} and never more than the {} since your last prompt.",
+                exact(t.typed),
+                exact(FIRST_PROMPT_MAX),
+                exact(wall)
+            ),
         ),
         (_, Why::First) => (
             format!("first action, counts {}", ago(base)),
@@ -358,7 +379,7 @@ pub fn note(t: &Turn) -> (String, String) {
         ),
         (_, Why::Wall { wall }) => (
             format!("{} since your last action", ago(wall)),
-            "it can't count more than the time since your last action.".to_string(),
+            "a prompt never counts more than the time since your last action.".to_string(),
         ),
         (kind, Why::Clamped { secs, min, max }) => {
             let (since, from) = match (kind, t.from_agent) {
@@ -397,11 +418,19 @@ pub fn note(t: &Turn) -> (String, String) {
             t.run
         );
         long = format!(
-            "{} short or repeat prompts in a row, each within {} of the last, and none show testing. that looks like hitting retry, so only typing time counts ({}).{}",
+            "{} short or repeat prompts in a row, each within {} of the last, and none show testing. that looks like hitting retry, so only typing time counts, up to {}.{}",
             t.run,
             exact(LOOP_GAP),
-            exact(t.typed),
+            exact(DARK_FLOW_KEEP),
             if t.flagged_secs > 0 { was } else { String::new() },
+        );
+    }
+    if t.overlap_secs > 0 {
+        short += ", overlaps another session";
+        let _ = write!(
+            long,
+            "\nanother session was already counting {} of this same time, so that part counts there and not here.",
+            exact(t.overlap_secs)
         );
     }
     if t.kind == TurnKind::Prompt && !t.tags.is_empty() {
@@ -462,9 +491,11 @@ const HOW: &str = r#"<h2>How it counts</h2>
 <li>A longer gap is a break. Then only 2 min plus typing time counts (5 min if you tested something). Short prompts get 2 min at most.</li>
 <li>If you reply within 2 min of the agent finishing, up to 2 min of agent time counts too.</li>
 <li>Typing time is guessed from how long the prompt is, about 48 words a minute, between 5s and 5 min.</li>
+<li>A prompt never counts more than the time since your last action. The first prompt of a session, or one right after a prompt the agent never answered, only counts typing time, up to 2 min.</li>
 <li>Stopping the agent counts the time since your last action, up to 5 min. A command you run counts up to 5 min, a slash command up to 30s and a rejected tool call up to 1 min.</li>
 <li>Agent time never counts as your time.</li>
-<li>3 or more short or repeated prompts in a row, each within 15 min of the last and without testing, is dark flow. Only typing time counts for those.</li>
+<li>3 or more short or repeated prompts in a row, each within 15 min of the last and without testing, is dark flow. Only typing time counts for those, up to 30s each.</li>
+<li>Sessions running at the same time (two windows, two tools or two computers) only count the same minutes once.</li>
 <li>If a session was resumed or forked, the copied messages only count once.</li>
 <li>The notes say why each row got its time. Hover over a note for the numbers.</li>
 <li>Prompts are only used for word counts and notes. The text isn't saved.</li>
