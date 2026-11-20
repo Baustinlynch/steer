@@ -136,15 +136,7 @@ fn user_event(v: &Value, t: DateTime<Utc>) -> Option<Event> {
     let (raw, images) = extract_text(content);
     let stripped = strip_tag(&raw, "system-reminder");
     let text = stripped.trim();
-    const SKIP: [&str; 6] = [
-        "<task-notification>",
-        "<local-command-stdout>",
-        "<local-command-stderr>",
-        "<bash-stdout>",
-        "<bash-stderr>",
-        "Caveat:",
-    ];
-    if SKIP.iter().any(|p| text.starts_with(p)) {
+    if injected(text) {
         return None;
     }
     let kind = if text.starts_with("[Request interrupted by user") {
@@ -159,6 +151,51 @@ fn user_event(v: &Value, t: DateTime<Utc>) -> Option<Event> {
         EventKind::Prompt(PromptInfo::analyze(text, images))
     };
     Some(Event { id: None, t, kind })
+}
+
+/// Text Claude Code puts in a user message itself, never typed by the person.
+const INJECTED: [&str; 7] = [
+    "<task-notification>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "Caveat:",
+    // The summary Claude Code puts in after squeezing a long conversation down.
+    "This session is being continued from a previous conversation",
+];
+
+pub(crate) fn injected(text: &str) -> bool {
+    INJECTED.iter().any(|p| text.starts_with(p))
+}
+
+/// A short fingerprint of a prompt's text for finding it in the log: the start of the
+/// text with spaces evened out, hashed (FNV-1a, so it's the same in every version).
+pub(crate) fn prompt_key(text: &str) -> String {
+    let start: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in start.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// For a "user" line in a Claude Code log: its text, and whether the person typed it.
+/// Task notices, messages from other agents, scheduled prompts and summaries say false.
+/// The live hook can't tell these apart, so it checks its prompts against this.
+pub(crate) fn prompt_line(v: &Value) -> Option<(DateTime<Utc>, String, bool)> {
+    if v.get("type").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let t = timestamp(v)?;
+    let content = v.pointer("/message/content")?;
+    if content.as_array().is_some_and(|b| b.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))) {
+        return None;
+    }
+    let (raw, _) = extract_text(content);
+    let text = strip_tag(&raw, "system-reminder").trim().to_owned();
+    let typed = matches!(user_event(v, t), Some(Event { kind: EventKind::Prompt(_), .. }));
+    Some((t, text, typed))
 }
 
 fn extract_text(content: &Value) -> (String, usize) {

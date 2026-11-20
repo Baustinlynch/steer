@@ -90,6 +90,8 @@ const SKIP = [
   "<bash-stdout>",
   "<bash-stderr>",
   "Caveat:",
+  // The summary Claude Code puts in after squeezing a long conversation down.
+  "This session is being continued from a previous conversation",
 ];
 
 // Lines that can't be a user, assistant or title entry get skipped without parsing.

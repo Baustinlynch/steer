@@ -7,7 +7,7 @@
 use crate::prompt::PromptInfo;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -160,7 +160,18 @@ fn record() -> Option<()> {
     let e = match v.get("hook_event_name")?.as_str()? {
         "UserPromptSubmit" => {
             let text = v.get("prompt")?.as_str()?.trim();
-            prompt_event(new_id(), session, &project, "claude-code", Utc::now(), &PromptInfo::analyze(text, 0))
+            // Background task notices, messages from other agents and scheduled prompts
+            // come through this hook too, as if the person typed them. The obvious ones
+            // are skipped here, and the rest get checked against Claude Code's log
+            // before sending (see `verdict`).
+            if crate::claude::injected(text) {
+                return None;
+            }
+            let mut e = prompt_event(new_id(), session, &project, "claude-code", Utc::now(), &PromptInfo::analyze(text, 0));
+            if let Some(log) = v.get("transcript_path").and_then(Value::as_str) {
+                e["check"] = json!({ "log": log, "key": crate::claude::prompt_key(text) });
+            }
+            e
         }
         "PostToolUse" => {
             let tool = v.get("tool_name").and_then(Value::as_str).unwrap_or("");
@@ -342,7 +353,85 @@ pub fn flush() -> Result<usize, String> {
 }
 
 fn send_all(config: &Config) -> Result<usize, String> {
+    let mut waiting = Vec::new();
+    let result = send_files(config, &mut waiting);
+    // Prompts whose log line isn't written yet go back in the queue for the next flush.
+    // Only after the loop, so this flush doesn't pick them up again right away.
+    if !waiting.is_empty() {
+        let _ = enqueue(&waiting);
+    }
+    result
+}
+
+enum Verdict {
+    Send,
+    Drop,
+    Wait,
+}
+
+/// A prompt in Claude Code's log: when, the fingerprint of its text, and whether the
+/// person typed it.
+type LogPrompt = (DateTime<Utc>, String, bool);
+
+/// The Claude Code hook can't tell who sent a prompt, but Claude Code's log for the
+/// session says it: the person, a background task notice, another agent, a schedule. So
+/// a hook prompt carries `check` (the log's path and a fingerprint of its text) and is
+/// looked up there a few seconds later. Typed ones get sent, the rest are dropped. One
+/// that never shows up within a minute is sent anyway, so a change in the log format
+/// can't lose real prompts.
+fn verdict(e: &Value, now: DateTime<Utc>, logs: &mut HashMap<String, Vec<LogPrompt>>) -> Verdict {
+    let Some(check) = e.get("check") else { return Verdict::Send };
+    let (Some(path), Some(key)) = (check["log"].as_str(), check["key"].as_str()) else { return Verdict::Send };
+    let t = e["t"]
+        .as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map_or(now, |d| d.with_timezone(&Utc));
+    let lines = logs.entry(path.to_owned()).or_insert_with(|| log_prompts(Path::new(path)));
+    let near: Vec<&LogPrompt> =
+        lines.iter().filter(|(lt, _, _)| (-10..=60).contains(&(*lt - t).num_seconds())).collect();
+    if let Some((_, _, typed)) = near.iter().find(|(_, k, _)| k == key) {
+        return if *typed { Verdict::Send } else { Verdict::Drop };
+    }
+    if (now - t).num_seconds() < 60 {
+        return Verdict::Wait;
+    }
+    // Never found its own line. If everything around it in the log was not typed, it
+    // wasn't either.
+    if !near.is_empty() && near.iter().all(|(_, _, typed)| !typed) {
+        Verdict::Drop
+    } else {
+        Verdict::Send
+    }
+}
+
+/// The prompts near the end of a Claude Code log: when, the fingerprint of the text, and
+/// whether the person typed it. Only the last few MB are read, logs get big.
+fn log_prompts(path: &Path) -> Vec<LogPrompt> {
+    const TAIL: u64 = 4 << 20;
+    let Ok(mut f) = fs::File::open(path) else { return Vec::new() };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(TAIL);
+    let mut buf = Vec::new();
+    use std::io::Seek;
+    if f.seek(std::io::SeekFrom::Start(start)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+    if start > 0 {
+        lines.next(); // probably cut off in the middle
+    }
+    lines
+        .filter(|l| l.contains("\"type\":\"user\""))
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| crate::claude::prompt_line(&v))
+        .map(|(t, text, typed)| (t, crate::claude::prompt_key(&text), typed))
+        .collect()
+}
+
+fn send_files(config: &Config, waiting: &mut Vec<Value>) -> Result<usize, String> {
     let mut sent = 0;
+    let mut logs = HashMap::new();
     loop {
         // Move the queue aside first, so hooks can keep adding to a fresh one meanwhile.
         let queue = dir().join("queue.jsonl");
@@ -365,11 +454,27 @@ fn send_all(config: &Config) -> Result<usize, String> {
                 .lines()
                 .filter_map(|l| serde_json::from_str(l).ok())
                 .collect();
-            for chunk in events.chunks(BATCH) {
+            let now = Utc::now();
+            let mut ready = Vec::new();
+            let mut held = Vec::new();
+            for mut e in events {
+                match verdict(&e, now, &mut logs) {
+                    Verdict::Send => {
+                        if let Some(o) = e.as_object_mut() {
+                            o.remove("check"); // the log's path never leaves this computer
+                        }
+                        ready.push(e);
+                    }
+                    Verdict::Drop => {}
+                    Verdict::Wait => held.push(e),
+                }
+            }
+            for chunk in ready.chunks(BATCH) {
                 post(&config.server, "/api/events", Some(&config.key), &json!({ "events": chunk }))?;
                 sent += chunk.len();
                 let _ = fs::write(dir().join("last-sent"), Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
             }
+            waiting.extend(held);
             let _ = fs::remove_file(&file);
         }
         let _ = fs::write(lock_path(), std::process::id().to_string());
@@ -888,6 +993,42 @@ mod tests {
         let v: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(v["hooks"]["stop"], json!([{ "command": "say done" }]));
         assert!(v["hooks"].get("beforeSubmitPrompt").is_none());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn hook_prompts_are_checked_against_the_log() {
+        let tmp = std::env::temp_dir().join(format!("steer-log-{}", new_id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("session.jsonl");
+        let t0 = DateTime::parse_from_rfc3339("2026-11-20T15:00:00Z").unwrap().with_timezone(&Utc);
+        let at = |s: i64| (t0 + chrono::Duration::seconds(s)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let lines = [
+            json!({ "type": "user", "timestamp": at(0), "origin": { "kind": "human" }, "message": { "role": "user", "content": "make the snake   move faster" } }),
+            json!({ "type": "user", "timestamp": at(5), "origin": { "kind": "peer" }, "message": { "role": "user", "content": "Another session says the build is done" } }),
+            json!({ "type": "user", "timestamp": at(10), "isMeta": true, "promptSource": "system", "turnOrigin": "scheduled", "message": { "role": "user", "content": "Hourly check, look at the inbox" } }),
+            json!({ "type": "assistant", "timestamp": at(12), "message": { "role": "assistant", "content": [] } }),
+        ];
+        fs::write(&log, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+
+        let hooked = |text: &str, s: i64| {
+            let mut e = event(new_id(), "s1", "game", "claude-code", t0 + chrono::Duration::seconds(s), "prompt");
+            e["check"] = json!({ "log": log.to_string_lossy(), "key": crate::claude::prompt_key(text) });
+            e
+        };
+        let later = t0 + chrono::Duration::seconds(90);
+        let mut logs = HashMap::new();
+        let send = |v: Verdict| matches!(v, Verdict::Send);
+        // The hook's text and the log's can differ in spacing.
+        assert!(send(verdict(&hooked("make the snake move faster", 0), later, &mut logs)));
+        assert!(matches!(verdict(&hooked("Another session says the build is done", 5), later, &mut logs), Verdict::Drop));
+        assert!(matches!(verdict(&hooked("Hourly check, look at the inbox", 10), later, &mut logs), Verdict::Drop));
+        // Not in the log yet: wait. Still not there after a minute: send it anyway.
+        let mut fresh = HashMap::new();
+        assert!(matches!(verdict(&hooked("add a pause menu", 300), t0 + chrono::Duration::seconds(305), &mut fresh), Verdict::Wait));
+        assert!(send(verdict(&hooked("add a pause menu", 300), t0 + chrono::Duration::seconds(400), &mut fresh)));
+        // No check at all (older client, or Cursor): sent like before.
+        assert!(send(verdict(&event(new_id(), "s1", "game", "claude-code", t0, "prompt"), later, &mut logs)));
         let _ = fs::remove_dir_all(&tmp);
     }
 

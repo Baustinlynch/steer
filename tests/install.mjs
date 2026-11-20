@@ -8,7 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const windows = process.platform === "win32";
 const built = resolve(process.argv[2] ?? `target/release/steer${windows ? ".exe" : ""}`);
@@ -124,6 +124,38 @@ try {
   assert.match(sent, /"words":12/);
   assert.ok(!sent.includes("blue"), "prompt text never leaves the computer");
   assert.match(await steer(bin, ["status"]), /last sent: just now/);
+
+  // A message from another agent and a scheduled prompt come through the same hook as
+  // typed ones. They're checked against Claude Code's log and only the typed one is sent.
+  const log = join(home, ".claude", "projects", "proj", "s2.jsonl");
+  mkdirSync(dirname(log), { recursive: true });
+  const nowIso = new Date().toISOString();
+  const said = {
+    typed: "the jump feels floaty, lower the gravity in player.rs",
+    peer: "Another session says the build finished",
+    scheduled: "Check the inbox and summarize it",
+  };
+  writeFileSync(
+    log,
+    [
+      { type: "user", timestamp: nowIso, origin: { kind: "human" }, message: { role: "user", content: said.typed } },
+      { type: "user", timestamp: nowIso, origin: { kind: "peer" }, message: { role: "user", content: said.peer } },
+      { type: "user", timestamp: nowIso, isMeta: true, promptSource: "system", turnOrigin: "scheduled", message: { role: "user", content: said.scheduled } },
+    ].map((l) => JSON.stringify(l) + "\n").join(""),
+  );
+  for (const text of Object.values(said)) {
+    await steer(bin, ["hook"], {
+      input: JSON.stringify({ session_id: "s2", transcript_path: log, cwd: join(home, "proj"), hook_event_name: "UserPromptSubmit", prompt: text }),
+    });
+  }
+  const s2Prompts = () => readFileSync(eventsFile, "utf8").split("\n").filter((l) => l.includes('"session":"s2"') && l.includes('"kind":"prompt"'));
+  await until("the typed prompt to reach the server", async () => {
+    await steer(bin, ["flush"], { allowFail: true });
+    return s2Prompts().length > 0;
+  });
+  await steer(bin, ["flush"], { allowFail: true });
+  assert.equal(s2Prompts().length, 1, "only the typed prompt is sent");
+  assert.ok(!readFileSync(eventsFile, "utf8").includes(log), "the log's path never leaves the computer");
 
   // 3. The watcher starts and checks in.
   console.log("step 3");
