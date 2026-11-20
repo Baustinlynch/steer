@@ -1,34 +1,67 @@
 # steer
 
-demo for hack club's ai time tracking bounty. it reads your claude code logs and makes a report of how much time you actually spent working with the agent, next to how long the agent ran by itself.
+steer tracks the time you spend working with ai coding agents. the time the agent runs by itself doesnt count, only what you do around it, like writing prompts, reading what it did, testing and fixing stuff. made for hack club's ai time tracking bounty.
 
-## running it
+works with claude code, codex, opencode, copilot (vs code and cli) and cursor.
+
+## install
+
+mac and linux:
 
 ```bash
-cargo build --release
+curl -fsSL https://steer.duck.hackclub.app/install.sh | sh
 ```
+
+windows (powershell):
+
+```powershell
+irm https://steer.duck.hackclub.app/install.ps1 | iex
+```
+
+it asks for a name, then hooks into your tools. your page is at `https://steer.duck.hackclub.app/u/NAME` and updates while you work.
+
+to undo everything:
 
 ```bash
-./target/release/steer --days 30
+~/.steer/bin/steer setup --remove
 ```
 
-then open steer-report.html. use `--hide-titles` if you want to share a screenshot. `--help` shows the rest.
+## how it works
+
+- claude code and cursor run `steer hook` on every prompt, tool call and when the agent finishes
+- codex, opencode and copilot dont have hooks like that, so a small background watcher (`steer watch`) reads their session logs every 5 seconds. it uses about 0.2% cpu
+- events go into a queue in `~/.steer` and get sent to the server in the background, so your tools never wait on the network
+- the server stamps each event when it arrives. anything more than 5 minutes off doesnt count, so you cant make up old sessions later
 
 ## privacy
 
-everything stays on your computer. it reads `~/.claude/projects` and runs `git log` in your project folders. prompts are only used for word counts and notes like "screenshot" or "low info", the text isnt saved and isnt in the report.
+prompt text never leaves your computer. steer reads it to work out a few counts and then drops it. this is everything a prompt event sends:
+
+`id, session, project, via (which tool), time, words, chars, images, specific, observation, generic, repeat`
+
+project is the name of the git repo or folder you were in (your home folder shows up as "home"). your page is public.
 
 ## how time is counted
 
-the "how it counts" part at the bottom of the report explains it, and the code is in `src/analyze.rs`. short version: the time between the agent finishing and your next prompt counts (with caps), the time the agent runs by itself doesnt.
+the bottom of every report explains it, and the code is in `src/analyze.rs` (and `web/steer.js` for the website and server, which gives the same numbers). short version: the gap between the agent finishing and your next prompt counts, with caps, and loops of "continue" / "fix it" without testing dont count.
 
-## todo
+## other commands
 
-- live tracking (right now it only reads old logs)
-- codex, cursor, opencode, vs code
-- server with accounts and a reviewer view
-- check accuracy against reviewer labels
-- prebuilt downloads for windows, mac and linux
+```bash
+steer status                       # whats set up and whats waiting to send
+steer watch --dry-run --days 30    # what the watcher would send, as counts only
+steer report --days 30             # html report from your old claude code logs
+```
+
+the website also has a drop-a-folder version of the report that runs in your browser.
+
+## running your own server
+
+```bash
+PORT=8790 STEER_DATA=./data node server/server.mjs
+```
+
+then `steer signup NAME --server https://your.server`.
 
 ## license
 

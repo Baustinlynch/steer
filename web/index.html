@@ -13,7 +13,15 @@
 <h1>steer</h1>
 <p>Shows how much of your Claude Code time was you and how much was the agent working by itself. Made for Hack Club's AI time tracking bounty.</p>
 
-<h2>Your logs</h2>
+<h2>Live tracking</h2>
+<p>Install steer once and it tracks Claude Code, Codex, OpenCode, Copilot and Cursor while you work. Your page at steer.duck.hackclub.app/u/your-name updates as you go.</p>
+<p>Mac and Linux:</p>
+<pre><code>curl -fsSL https://steer.duck.hackclub.app/install.sh | sh</code></pre>
+<p>Windows (PowerShell):</p>
+<pre><code>irm https://steer.duck.hackclub.app/install.ps1 | iex</code></pre>
+<p class="muted">Prompt text never leaves your computer, only counts like how many words it had and whether it said what happened when you tested something. The code is at <a href="https://github.com/EwoudVV/steer">github.com/EwoudVV/steer</a>. To undo everything: <code>~/.steer/bin/steer setup --remove</code></p>
+
+<h2>Or check your old Claude Code logs</h2>
 <p>Claude Code keeps them in a hidden folder:</p>
 <ul>
 <li>Mac and Linux: <code>~/.claude/projects</code></li>
