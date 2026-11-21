@@ -54,6 +54,7 @@ const server = spawn("node", ["server/server.mjs"], {
     HCA_CLIENT_ID: "test-client",
     HCA_CLIENT_SECRET: "test-secret",
     HCA_BASE: `http://127.0.0.1:${FAKE_PORT}`,
+    STEER_REVIEWERS: "UREVIEW1, UREVIEW2",
   },
   stdio: "ignore",
 });
@@ -185,6 +186,83 @@ try {
   }
   assert.equal(limited, 5, "20 logins from one address, then it has to wait");
   assert.equal((await fetch(`${STEER}/api/cli-login`, { method: "POST", headers: { "x-forwarded-for": "10.9.9.10" } })).status, 200);
+
+  // 8. Reviewers: fraud squad or program reviewers sign in with Hack Club on a review
+  // page and approve, cut or reject its hours. Anyone else can only look.
+  {
+    const iso = (s) => new Date(Date.now() - s * 1000).toISOString();
+    const base = { session: "s1", project: "kart", via: "claude-code" };
+    const prompt = { kind: "prompt", words: 20, chars: 100, images: 0, specific: 2, observation: false, generic: false, repeat: false };
+    const sent = await json("/api/events", {
+      method: "POST",
+      headers: { authorization: `Bearer ${linked.key}` },
+      body: JSON.stringify({
+        events: [
+          { ...base, ...prompt, id: "k1", t: iso(200) },
+          { ...base, id: "k2", kind: "tool", tool: "Edit", t: iso(190) },
+          { ...base, id: "k3", kind: "stop", t: iso(150) },
+          { ...base, ...prompt, id: "k4", t: iso(60) },
+          { ...base, id: "k5", kind: "stop", t: iso(30) },
+        ],
+      }),
+    });
+    assert.equal(sent.body.accepted, 5);
+    const made = await json("/api/submit", { method: "POST", headers: { authorization: `Bearer ${linked.key}` }, body: '{"project":"kart"}' });
+    assert.equal(made.status, 201);
+    const path = new URL(made.body.url).pathname;
+    const id = path.slice(3);
+
+    // Programs and fraud squad can find everything by Slack id.
+    const lookupRes = await json("/api/slack/U123");
+    assert.equal(lookupRes.status, 200, JSON.stringify(lookupRes.body));
+    const lookup = lookupRes.body;
+    assert.equal(lookup.accounts.length, 1);
+    assert.equal(lookup.accounts[0].user, "duck");
+    assert.equal(lookup.accounts[0].reviews[0].id, id);
+    assert.equal(lookup.accounts[0].reviews[0].reviewed_hours, null);
+
+    /** Signs in through the fake Hack Club as nextUser, returns the callback's answer. */
+    const signIn = async () => {
+      const go = await fetch(`${STEER}/reviewer/login?r=${id}`, { redirect: "manual", headers: { "x-forwarded-for": "10.4.4.4" } });
+      assert.equal(go.status, 303);
+      const back = await fetch(go.headers.get("location"), { redirect: "manual" });
+      return fetch(back.headers.get("location"), { redirect: "manual" });
+    };
+    nextUser = { sub: "ident!nope", nickname: "rando", slack_id: "U999" };
+    const nope = await signIn();
+    assert.equal(nope.headers.get("set-cookie"), null);
+    assert.match(await nope.text(), /isn't on this server's list of reviewers/);
+
+    nextUser = { sub: "ident!udo", nickname: "udo", slack_id: "UREVIEW1" };
+    const yes = await signIn();
+    assert.equal(yes.status, 303);
+    assert.equal(yes.headers.get("location"), path);
+    const cookie = yes.headers.get("set-cookie").split(";")[0];
+    assert.match(cookie, /^steer_rv=/);
+    const view = await (await fetch(STEER + path, { headers: { cookie } })).text();
+    assert.ok(view.includes("<form"), "a reviewer gets the form");
+    const csrf = /name="csrf" value="([^"]+)"/.exec(view)[1];
+    const decide = (fields, headers = {}) =>
+      fetch(`${STEER}${path}/decide`, {
+        method: "POST",
+        headers: { cookie, origin: STEER, "sec-fetch-site": "same-origin", ...headers },
+        body: new URLSearchParams(fields),
+        redirect: "manual",
+      });
+    assert.equal((await decide({ csrf: "wrong", action: "approve" })).status, 403, "the form's token has to match");
+    assert.equal((await decide({ csrf, action: "approve" }, { origin: "https://evil.example" })).status, 403, "only from the page itself");
+    assert.equal((await decide({ csrf, action: "reject" })).status, 400, "rejecting needs a note");
+    assert.equal((await decide({ csrf, action: "cut", hours: "99", note: "x" })).status, 400, "can't cut to more than it was");
+    assert.equal((await decide({ csrf, action: "reject", note: "no commits, nothing in the repo" })).status, 303);
+    const after = await (await fetch(STEER + path)).text();
+    assert.ok(after.includes("udo (UREVIEW1) rejected the hours"));
+    assert.ok(after.includes("Hours after review: 0.0h"));
+    assert.ok(!after.includes("<form"), "without the cookie it's just the page");
+    const info = (await json(`/api${path}`)).body;
+    assert.equal(info.reviewed_hours, "0.0");
+    assert.equal(info.decisions[0].by, "UREVIEW1");
+    assert.equal((await json("/api/slack/U123")).body.accounts[0].reviews[0].reviewed_hours, "0.0");
+  }
 
   console.log("login tests passed");
 } finally {

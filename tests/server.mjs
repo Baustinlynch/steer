@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { request } from "node:http";
+import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -51,8 +51,18 @@ const today = Array.from({ length: 19_900 }, (_, i) =>
 );
 writeFileSync(join(data, "events", "capped.jsonl"), today.join("\n") + "\n");
 
+// A fake GitHub for the commit lookups on review pages: knows the commits in `github`.
+const github = new Map(); // hash -> committer date
+const fakeGithub = createServer((req, res) => {
+  const m = /^\/repos\/a\/b\/commits\/([0-9a-f]+)$/.exec(req.url);
+  const date = m && github.get(m[1]);
+  if (!date) return res.writeHead(404).end("{}");
+  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sha: m[1], commit: { committer: { date } } }));
+});
+await new Promise((ok) => fakeGithub.listen(PORT + 1, "127.0.0.1", ok));
+
 const server = spawn("node", ["server/server.mjs"], {
-  env: { ...process.env, PORT: String(PORT), STEER_DATA: data, PUBLIC_URL: STEER },
+  env: { ...process.env, PORT: String(PORT), STEER_DATA: data, PUBLIC_URL: STEER, GITHUB_API: `http://127.0.0.1:${PORT + 1}` },
   stdio: ["ignore", "ignore", "inherit"],
 });
 for (let i = 0; i < 50; i++) {
@@ -262,6 +272,10 @@ try {
     const key = (await signup("rev", "10.0.0.20")).body.key;
     const at = (secs) => iso(Date.now() - secs * 1000);
     const hash = "0123456789abcdef0123456789abcdef01234567";
+    const moved = "1111111111111111111111111111111111111111"; // on GitHub, but made long before
+    const madeUp = "2222222222222222222222222222222222222222"; // not on GitHub at all
+    github.set(hash, at(115));
+    github.set(moved, iso(Date.now() - 5 * 86_400_000));
     const sent = await post(key, {
       events: [
         prompt({ project: "game2", t: at(240), words: 40, chars: 200, specific: 3 }),
@@ -269,11 +283,13 @@ try {
         ev({ project: "game2", kind: "stop", tool: undefined, t: at(200) }),
         { id: `id-${n++}`, session: "evidence", project: "game2", via: "steer", kind: "save", count: 2, t: at(150) },
         { id: `id-${n++}`, session: "evidence", project: "game2", via: "steer", kind: "commit", hash, t: at(120) },
+        { id: `id-${n++}`, session: "evidence", project: "game2", via: "steer", kind: "commit", hash: moved, t: at(110) },
+        { id: `id-${n++}`, session: "evidence", project: "game2", via: "steer", kind: "commit", hash: madeUp, t: at(100) },
         prompt({ project: "game2", t: at(60), observation: true }),
         ev({ project: "game2", kind: "stop", tool: undefined, t: at(30) }),
       ],
     });
-    assert.equal(sent.body.accepted, 7);
+    assert.equal(sent.body.accepted, 9);
     const submit = async (body, k = key) => {
       const res = await fetch(STEER + "/api/submit", { method: "POST", headers: k ? { authorization: `Bearer ${k}` } : {}, body: JSON.stringify(body) });
       return { status: res.status, body: await res.json() };
@@ -294,14 +310,45 @@ try {
     const path = new URL(made.body.url).pathname;
     const view = await get(path);
     assert.equal(view.status, 200);
-    for (const part of ["Review:", "For Unified", "Justification", "By day", "Sessions", `https://github.com/a/b/commit/${hash}`, "steer saw 1 commit, 1 code change made by hand"]) {
+    for (const part of [
+      "Review:",
+      "For Unified",
+      "Justification",
+      "By day",
+      "Sessions",
+      `https://github.com/a/b/commit/${hash}`,
+      "steer saw 3 commits, 1 code change made by hand",
+      "1 of the 3 commits looked up on GitHub is there with the time steer saw, 1 has a different time, 1 isn't on GitHub",
+      "yes, same time",
+      "yes, but made",
+      "not found",
+      `/api/r/`,
+    ]) {
       assert.ok(view.text.includes(part), `the review page has ${part}`);
     }
+    assert.ok(!view.text.includes("<form"), "no review form unless a reviewer is signed in");
     const info = JSON.parse((await get(`/api${path}`)).text);
     assert.equal(info.user, "rev");
     assert.equal(info.project, "game2");
     assert.equal(info.hours, made.body.hours);
     assert.equal(info.html, undefined, "the api leaves out the page itself");
+    assert.equal(info.commit_checks[madeUp].status, "missing");
+    assert.equal(info.reviewed_hours, null);
+    assert.deepEqual(info.decisions, []);
+
+    // The events behind the page, and all of an account's events.
+    const raw = (await get(`/api${path}/events`)).text.trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(raw.length, 9, "every event of the project up to when the page was made");
+    assert.ok(raw.every((e) => e.project === "game2" && e.got));
+    const all = (await get("/api/u/rev/events?project=game2")).text.trim().split("\n");
+    assert.equal(all.length, 9);
+    assert.equal((await get("/api/u/nobody/events")).status, 404);
+    assert.equal((await get("/api/slack/nope")).status, 400);
+    assert.deepEqual(JSON.parse((await get("/api/slack/U0NOBODY1")).text).accounts, []);
+
+    // Deciding needs a reviewer session.
+    const res = await fetch(STEER + `${path}/decide`, { method: "POST", body: "action=approve" });
+    assert.equal(res.status, 403);
 
     // More work afterwards doesn't change a page that was already submitted.
     await post(key, { events: [prompt({ project: "game2", t: iso(Date.now()) })] });
@@ -312,6 +359,7 @@ try {
 
   console.log(`server tests passed (big page ${cold.ms} ms, then ${warm.ms} ms cached)`);
 } finally {
+  fakeGithub.close();
   server.kill();
   rmSync(data, { recursive: true, force: true });
 }

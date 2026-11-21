@@ -851,8 +851,15 @@ const share = (n, of) => `${of ? Math.round((100 * n) / of) : 0}%`;
 /** Hours with one decimal, the way programs write them down. */
 export const hoursOf = (secs) => (Math.round(secs / 360) / 10).toFixed(1);
 
+/** How many of the commits GitHub confirmed, from the server's lookups. */
+export function commitTally(checks) {
+  const n = { ok: 0, time: 0, missing: 0, unchecked: 0 };
+  for (const c of Object.values(checks ?? {})) n[c.status] = (n[c.status] ?? 0) + 1;
+  return n;
+}
+
 /** The written justification for a review, as plain text. */
-export function justification(name, project, f, found) {
+export function justification(name, project, f, found, checks = null) {
   const span = f.first ? (f.first === f.last ? `on ${niceDay(f.first)}` : `from ${niceDay(f.first)} to ${niceDay(f.last)}`) : "";
   const lines = [];
   lines.push(
@@ -869,7 +876,15 @@ export function justification(name, project, f, found) {
   if (f.commits.length) seen.push(plural(f.commits.length, "commit"));
   if (f.changes) seen.push(`${plural(f.changes, "code change")} made by hand`);
   if (f.runs) seen.push(plural(f.runs, "command") + " run in a terminal");
-  if (seen.length) lines.push(`steer saw ${seen.join(", ")} as they happened.`);
+  if (seen.length) {
+    let l = `steer saw ${seen.join(", ")} as they happened.`;
+    if (checks && Object.keys(checks).length) {
+      const n = commitTally(checks);
+      const looked = n.ok + n.time + n.missing;
+      if (looked) l += ` ${n.ok} of the ${plural(looked, "commit")} looked up on GitHub ${n.ok === 1 ? "is" : "are"} there with the time steer saw${n.time ? `, ${n.time} ${n.time === 1 ? "has" : "have"} a different time` : ""}${n.missing ? `, ${n.missing} ${n.missing === 1 ? "isn't" : "aren't"} on GitHub` : ""}.`;
+    }
+    lines.push(l);
+  }
   const left = [];
   if (f.flagged) left.push(`${fmtDur(f.flagged)} of "continue" loops without testing`);
   if (f.overlap) left.push(`${fmtDur(f.overlap)} that overlapped another session and was counted once`);
@@ -891,7 +906,7 @@ export function justification(name, project, f, found) {
 export function renderReview(p, info, found, rules = DEFAULT_RULES, facts = null) {
   const f = facts ?? reviewFacts(p);
   const repo = typeof info.repo === "string" && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(info.repo) ? info.repo : null;
-  const text = justification(info.name, p.name, f, found);
+  const text = justification(info.name, p.name, f, found, info.checks);
   const line = `${hoursOf(f.you)}h tracked with steer, review: ${info.url}`;
   const who = info.slack ? `Hack Club account ${esc(info.slack)}${info.verified ? " (verified)" : ""}` : "not linked to a Hack Club account";
   const range = `${info.from ? niceDay(info.from) : "the start"} to ${info.to ? niceDay(info.to) : niceDay(utcDate(info.frozen))}`;
@@ -924,11 +939,31 @@ ${text.split("\n\n").map((l) => `<p>${esc(l)}</p>`).join("\n")}
   }
   h += "</table></div>\n";
   if (f.commits.length) {
-    h += `<h2>Commits</h2>\n<p class="muted">Seen by steer when they were made.${repo ? " Each links to it on GitHub, so you can check it's there and what it changed." : " No GitHub repo was given, so compare these with the project's git log."}</p>\n<div class="scroll"><table class="list">\n<tr><th>When (UTC)</th><th>Commit</th></tr>\n`;
+    const checks = info.checks ?? null;
+    const about = repo
+      ? checks
+        ? ` Each one was looked up on GitHub when this page was made: is it there, and does GitHub's time match when steer saw it.`
+        : " Each links to it on GitHub, so you can check it's there and what it changed."
+      : " No GitHub repo was given, so compare these with the project's git log.";
+    h += `<h2>Commits</h2>\n<p class="muted">Seen by steer when they were made.${about}</p>\n<div class="scroll"><table class="list">\n<tr><th>When steer saw it (UTC)</th><th>Commit</th>${checks ? "<th>On GitHub</th>" : ""}</tr>\n`;
+    const shown = (t) => new Date(t).toISOString().slice(0, 16).replace("T", " ");
     for (const c of f.commits) {
-      const when = new Date(c.t).toISOString().slice(0, 16).replace("T", " ");
       const hash = c.hash ? (repo ? `<a href="${esc(`${repo}/commit/${c.hash}`)}">${esc(c.hash.slice(0, 12))}</a>` : `<code>${esc(c.hash.slice(0, 12))}</code>`) : "";
-      h += `<tr><td>${when}</td><td>${hash}</td></tr>\n`;
+      let gh = "";
+      if (checks) {
+        const k = c.hash ? checks[c.hash] : null;
+        gh = !k
+          ? '<span class="muted">not looked up</span>'
+          : k.status === "ok"
+            ? "yes, same time"
+            : k.status === "time"
+              ? `<span class="red">yes, but made ${esc(shown(k.date))}</span>`
+              : k.status === "missing"
+                ? '<span class="red">not found</span>'
+                : '<span class="muted">GitHub didn\'t answer</span>';
+        gh = `<td>${gh}</td>`;
+      }
+      h += `<tr><td>${shown(c.t)}</td><td>${hash}</td>${gh}</tr>\n`;
     }
     h += "</table></div>\n";
   }

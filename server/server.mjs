@@ -78,6 +78,16 @@ const REVIEW_ID = /^[A-Za-z0-9_-]{12}$/;
 const REVIEW_SESSIONS = 500; // sessions a review page draws, the totals count all of them
 const GITHUB_REPO = /^https:\/\/github\.com\/[\w.-]{1,100}\/[\w.-]{1,100}$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
+// Commits on a review page get looked up on GitHub. A token raises GitHub's limit from
+// 60 lookups an hour to 5,000.
+const GITHUB_API = (process.env.GITHUB_API ?? "https://api.github.com").replace(/\/$/, "");
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || null;
+const COMMIT_CHECKS = 40; // commits looked up per review page, the newest ones
+const COMMIT_CLOSE = 15 * 60 * 1000; // a commit's time on GitHub this close to when steer saw it matches
+// Slack ids of people who can approve, cut or reject review pages: fraud squad and
+// program reviewers. Set on the server, comma separated.
+const REVIEWERS = new Set((process.env.STEER_REVIEWERS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+const SLACK_ID = /^[UW][A-Z0-9]{2,20}$/;
 const eventsFile = (name) => join(DATA, "events", `${name}.jsonl`);
 const sha256 = (s) => createHash("sha256").update(s).digest("hex");
 
@@ -471,6 +481,10 @@ function workerMain() {
 
   async function job({ op, name, version, project, from, to, info }) {
     const projects = await projectsOf(name, version);
+    if (op === "commits") {
+      const whole = projects.find((x) => x.name === project);
+      return whole ? reviewFacts(projectBetween(whole, from, to)).commits : [];
+    }
     if (op === "review") {
       const whole = projects.find((x) => x.name === project);
       if (!whole) return null;
@@ -604,6 +618,7 @@ const STATIC = {
   "/app.js": ["app.js", "text/javascript; charset=utf-8"],
   "/steer.js": ["steer.js", "text/javascript; charset=utf-8"],
   "/style.css": ["style.css", "text/css; charset=utf-8"],
+  "/trust": ["trust.html", "text/html; charset=utf-8"],
   "/install.sh": ["install.sh", "text/plain; charset=utf-8"],
   "/install.ps1": ["install.ps1", "text/plain; charset=utf-8"],
 };
@@ -770,7 +785,11 @@ async function submitReview(req, res) {
   const hc = users[name].hc ?? null;
   const frozen = new Date().toISOString();
   const url = `${PUBLIC_URL}/r/${id}`;
-  const info = { name, slack: hc?.slack_id ?? null, verified: hc?.verification_status === "verified", from, to, frozen, url, repo };
+  const info = { name, slack: hc?.slack_id ?? null, verified: hc?.verification_status === "verified", from, to, frozen, url, repo, checks: null };
+  if (repo && store.counted) {
+    const commits = await work({ op: "commits", name, version: store.counted, project, from, to });
+    if (commits.length) info.checks = await checkCommits(repo, commits);
+  }
   const r = store.counted ? await work({ op: "review", name, version: store.counted, project, from, to, info }) : null;
   if (!r) return json(res, 404, { error: `nothing tracked in a project called ${project}` });
   if (r.empty) return json(res, 404, { error: `nothing tracked in ${project} in those days` });
@@ -791,11 +810,169 @@ async function submitReview(req, res) {
     hours: r.hours,
     url,
     line: r.line,
+    commit_checks: info.checks,
     html: r.html,
   };
   mkdirSync(REVIEWS, { recursive: true });
   writeFileSync(reviewFile(id), JSON.stringify(review), { flag: "wx" });
+  users[name].reviews = [...(users[name].reviews ?? []), { id, project, hours: r.hours, frozen }].slice(-500);
+  saveUsers();
   json(res, 201, { id, url, hours: r.hours, your_time: fmtDur(r.secs), line: r.line });
+}
+
+/**
+ * Looks each commit up on GitHub: "ok" when it's there and GitHub's commit time is
+ * within 15 minutes of when steer saw it, "time" when it's there with a different
+ * time, "missing" when GitHub doesn't have it (not pushed, or made up), "unchecked"
+ * when GitHub didn't answer.
+ */
+async function checkCommits(repo, commits) {
+  const [owner, name] = new URL(repo).pathname.slice(1).split("/");
+  const headers = { accept: "application/vnd.github+json", "user-agent": "steer-review-pages", ...(GITHUB_TOKEN ? { authorization: `Bearer ${GITHUB_TOKEN}` } : {}) };
+  const out = {};
+  const list = commits.filter((c) => c.hash).slice(-COMMIT_CHECKS);
+  const one = async (c) => {
+    try {
+      const r = await fetch(`${GITHUB_API}/repos/${owner}/${name}/commits/${c.hash}`, { headers, signal: AbortSignal.timeout(8_000) });
+      if (r.status === 404 || r.status === 422) return { status: "missing" };
+      if (!r.ok) return { status: "unchecked" };
+      const j = await r.json();
+      const when = Date.parse(j?.commit?.committer?.date ?? "");
+      if (Number.isNaN(when)) return { status: "unchecked" };
+      return { status: Math.abs(when - c.t) <= COMMIT_CLOSE ? "ok" : "time", date: new Date(when).toISOString() };
+    } catch {
+      return { status: "unchecked" };
+    }
+  };
+  for (let i = 0; i < list.length; i += 8) {
+    const batch = list.slice(i, i + 8);
+    const results = await Promise.all(batch.map(one));
+    batch.forEach((c, k) => (out[c.hash] = results[k]));
+  }
+  return out;
+}
+
+// ----- reviewers: approve, cut hours or reject a review page -----
+
+const decisionsFile = (id) => join(REVIEWS, `${id}.decisions.jsonl`);
+
+function decisionsOf(id) {
+  if (!existsSync(decisionsFile(id))) return [];
+  return readFileSync(decisionsFile(id), "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+/** The hours a review page ends up with after its latest decision, or null if nobody decided yet. */
+function reviewedHours(r, decisions) {
+  const last = decisions[decisions.length - 1];
+  if (!last) return null;
+  return last.action === "reject" ? "0.0" : last.action === "cut" ? last.hours : r.hours;
+}
+
+const SESSION_TTL = 12 * 60 * 60 * 1000;
+const sessions = new Map(); // cookie token -> { slack, name, csrf, until }
+const reviewerStates = new Map(); // oauth state -> { review, created }
+
+function reviewerOf(req) {
+  const m = /(?:^|;\s*)steer_rv=([A-Za-z0-9_-]{20,64})/.exec(req.headers.cookie ?? "");
+  const s = m && sessions.get(m[1]);
+  if (!s || s.until < Date.now() || !REVIEWERS.has(s.slack)) return null;
+  return s;
+}
+
+function reviewerLogin(req, res, review) {
+  if (!HCA) return page(res, "steer", "<h1>steer</h1>\n<p>This server doesn't have Hack Club login set up.</p>", { status: 503 });
+  if (!REVIEW_ID.test(review)) return send(res, 400, "Bad review page");
+  const ip = clientIp(req);
+  if (!loginStarts.take(ip)) return page(res, "steer", "<h1>steer</h1>\n<p>Too many logins from here, wait a few minutes.</p>", { status: 429 });
+  if (reviewerStates.size >= LOGINS_MAX) return page(res, "steer", "<h1>steer</h1>\n<p>Too many logins right now, try again in a few minutes.</p>", { status: 503 });
+  const state = randomBytes(16).toString("base64url");
+  reviewerStates.set(state, { review, created: Date.now() });
+  const q = new URLSearchParams({ client_id: HCA.id, redirect_uri: `${PUBLIC_URL}/auth/callback`, response_type: "code", scope: HCA_SCOPES, state });
+  res.writeHead(303, { location: `${HCA_BASE}/oauth/authorize?${q}` });
+  res.end();
+}
+
+async function reviewerCallback(res, authCode, state) {
+  const { review } = reviewerStates.get(state);
+  reviewerStates.delete(state);
+  const info = authCode ? await hcaUser(authCode) : null;
+  if (!info?.slack_id) return page(res, "steer", "<h1>steer</h1>\n<p>Hack Club didn't confirm the login, try again.</p>");
+  if (!REVIEWERS.has(info.slack_id)) {
+    return page(
+      res,
+      "steer",
+      `<h1>Not a reviewer</h1>\n<p>Your Hack Club account (${esc(info.slack_id)}) isn't on this server's list of reviewers. Fraud squad and program reviewers get added on request.</p>\n<p><a href="/r/${review}">Back to the review page</a></p>`,
+    );
+  }
+  const token = randomBytes(24).toString("base64url");
+  sessions.set(token, {
+    slack: info.slack_id,
+    name: String(info.nickname || info.name || info.slack_id).slice(0, 60),
+    csrf: randomBytes(16).toString("base64url"),
+    until: Date.now() + SESSION_TTL,
+  });
+  const secure = PUBLIC_URL.startsWith("https://") ? "; Secure" : "";
+  res.writeHead(303, {
+    location: `/r/${review}`,
+    "set-cookie": `steer_rv=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL / 1000}${secure}`,
+  });
+  res.end();
+}
+
+async function decide(req, res, id) {
+  const who = reviewerOf(req);
+  if (!who) return send(res, 403, "Sign in as a reviewer first.");
+  if (!fromHere(req)) return send(res, 403, "This form only works from the review page.");
+  const r = readReview(id);
+  if (!r) return send(res, 404, "No such review page");
+  const body = await readBody(req, 10_000);
+  if (body === TOO_BIG) return tooLarge(req, res);
+  const form = new URLSearchParams(body);
+  const csrf = Buffer.from(form.get("csrf") ?? "");
+  if (csrf.length !== who.csrf.length || !timingSafeEqual(csrf, Buffer.from(who.csrf))) return send(res, 403, "This form expired, reload the page.");
+  const action = form.get("action");
+  const note = clean(form.get("note") ?? "", 1000).trim();
+  let hours = null;
+  if (!["approve", "cut", "reject"].includes(action)) return send(res, 400, "Pick approve, cut or reject.");
+  if (action === "cut") {
+    const h = Number(form.get("hours"));
+    if (!Number.isFinite(h) || h < 0 || h >= Number(r.hours)) return send(res, 400, `Cut hours to a number from 0 to under ${r.hours}.`);
+    hours = h.toFixed(1);
+  }
+  if (action !== "approve" && !note) return send(res, 400, "Say why in the note, the person sees it.");
+  const d = { at: new Date().toISOString(), by: who.slack, name: who.name, action, hours, note };
+  appendFileSync(decisionsFile(id), JSON.stringify(d) + "\n");
+  res.writeHead(303, { location: `/r/${id}` });
+  res.end();
+}
+
+function decisionsHtml(r, decisions, who) {
+  let h = "";
+  if (decisions.length) {
+    h += `<h2>Reviewed</h2>\n<ul>\n`;
+    for (const d of decisions) {
+      const what = d.action === "approve" ? `approved ${esc(r.hours)}h` : d.action === "cut" ? `cut ${esc(r.hours)}h to ${esc(d.hours)}h` : "rejected the hours";
+      h += `<li>${esc(new Date(d.at).toUTCString())}: ${esc(d.name)} (${esc(d.by)}) ${what}${d.note ? `: "${esc(d.note)}"` : ""}</li>\n`;
+    }
+    h += `</ul>\n<p><b>Hours after review: ${esc(reviewedHours(r, decisions))}h</b></p>\n`;
+  }
+  if (who) {
+    h += `<h2>Your review</h2>
+<p class="muted">Signed in as ${esc(who.name)} (${esc(who.slack)}). The person sees what you pick and your note.</p>
+<form method="post" action="/r/${r.id}/decide">
+<input type="hidden" name="csrf" value="${esc(who.csrf)}">
+<p><label><input type="radio" name="action" value="approve" checked> approve ${esc(r.hours)}h</label><br>
+<label><input type="radio" name="action" value="cut"> cut to <input name="hours" type="number" min="0" step="0.1" max="${esc(r.hours)}" style="width:5em"> hours</label><br>
+<label><input type="radio" name="action" value="reject"> reject the hours</label></p>
+<p><label>Note (needed to cut or reject)<br><textarea name="note" rows="3" cols="60" maxlength="1000"></textarea></label></p>
+<p><button>Save</button></p>
+</form>
+`;
+  }
+  return h;
 }
 
 function readReview(id) {
@@ -806,20 +983,71 @@ function readReview(id) {
   }
 }
 
-function reviewPage(res, id) {
+function reviewPage(req, res, id) {
   const r = readReview(id);
   if (!r) return send(res, 404, "No such review page");
+  const who = reviewerOf(req);
   const u = encodeURIComponent(r.user);
   const body = `<h1>Review: <a href="/u/${u}">${esc(r.user)}</a> / <a href="/u/${u}/${encodeURIComponent(r.project)}">${esc(r.project)}</a></h1>
-${r.html}`;
-  page(res, `review · ${r.user} / ${r.project}`, body);
+${decisionsHtml(r, decisionsOf(id), who)}${r.html}
+<p class="muted">Every event behind this page, with when the server got it: <a href="/api/r/${id}/events">/api/r/${id}/events</a>. How steer catches faked time: <a href="/trust">/trust</a>.${who ? "" : ` Fraud squad or a program reviewer? <a href="/reviewer/login?r=${id}">Sign in to approve, cut or reject these hours</a>.`}</p>`;
+  page(res, `review · ${r.user} / ${r.project}`, body, who ? { csp: PAGE_CSP.replace("form-action 'none'", "form-action 'self'") } : {});
 }
 
 function reviewJson(res, id) {
   const r = readReview(id);
   if (!r) return json(res, 404, { error: "no such review page" });
   const { html, ...rest } = r;
-  json(res, 200, rest);
+  const decisions = decisionsOf(id);
+  json(res, 200, { ...rest, decisions, reviewed_hours: reviewedHours(r, decisions) });
+}
+
+/** Every stored event of one account as JSON lines, optionally for one project between two times. */
+async function eventsJsonl(res, name, { project = null, lo = -Infinity, hi = Infinity } = {}) {
+  res.writeHead(200, {
+    "content-type": "application/x-ndjson; charset=utf-8",
+    "x-content-type-options": "nosniff",
+    "content-disposition": `inline; filename="${name}${project ? `-${project.replace(/[^\w.-]/g, "_")}` : ""}.jsonl"`,
+  });
+  await eachEvent(name, (e) => {
+    if (project !== null && e.project !== project) return;
+    const t = Date.parse(e.t);
+    if (t < lo || t >= hi) return;
+    res.write(JSON.stringify(e) + "\n");
+  });
+  res.end();
+}
+
+function reviewEvents(res, id) {
+  const r = readReview(id);
+  if (!r) return json(res, 404, { error: "no such review page" });
+  const lo = r.from ? Date.parse(`${r.from}T00:00:00Z`) : -Infinity;
+  const hi = r.to ? Date.parse(`${r.to}T00:00:00Z`) + 86_400_000 : Date.parse(r.frozen);
+  return eventsJsonl(res, r.user, { project: r.project, lo, hi });
+}
+
+/** Everything steer has for one Slack account, for fraud squad and programs. */
+async function slackLookup(res, slack) {
+  const names = Object.keys(users).filter((n) => users[n].hc?.slack_id === slack);
+  const accounts = [];
+  for (const name of names) {
+    const store = await storeOf(name);
+    const hc = users[name].hc;
+    accounts.push({
+      user: name,
+      page: `${PUBLIC_URL}/u/${encodeURIComponent(name)}`,
+      events: `${PUBLIC_URL}/api/u/${encodeURIComponent(name)}/events`,
+      verification_status: hc.verification_status,
+      ysws_eligible: hc.ysws_eligible,
+      last_activity: store.last,
+      projects: (await reportOf(name, store)).hours,
+      reviews: (users[name].reviews ?? []).map((r) => {
+        const decisions = decisionsOf(r.id);
+        return { ...r, url: `${PUBLIC_URL}/r/${r.id}`, reviewed_hours: reviewedHours(r, decisions), decisions: decisions.length };
+      }),
+    });
+  }
+  json(res, 200, { slack_id: slack, accounts });
 }
 
 // ---------- sign in with Hack Club ----------
@@ -940,15 +1168,8 @@ function freeName(raw) {
   return name;
 }
 
-async function authCallback(res, authCode, state) {
-  const code = byState.get(state);
-  const l = code && logins.get(code);
-  if (!l || !HCA || !authCode) {
-    return page(res, "steer login", `<h1>steer</h1>\n<p>This login didn't work or expired. Run <code>steer login</code> again.</p>`);
-  }
-  byState.delete(state);
-  l.state = null;
-  let info;
+/** Swaps a Hack Club login code for who it is, or null. */
+async function hcaUser(authCode) {
   try {
     const tokenRes = await fetch(`${HCA_BASE}/oauth/token`, {
       method: "POST",
@@ -969,11 +1190,24 @@ async function authCallback(res, authCode, state) {
       signal: AbortSignal.timeout(10_000),
     });
     if (!infoRes.ok) throw new Error(`userinfo ${infoRes.status}`);
-    info = await infoRes.json();
+    return await infoRes.json();
   } catch (err) {
     console.error("hack club login failed:", err.message);
-    return page(res, "steer login", `<h1>steer</h1>\n<p>Hack Club didn't confirm the login. Run <code>steer login</code> again.</p>`);
+    return null;
   }
+}
+
+async function authCallback(res, authCode, state) {
+  if (reviewerStates.has(state)) return reviewerCallback(res, authCode, state);
+  const code = byState.get(state);
+  const l = code && logins.get(code);
+  if (!l || !HCA || !authCode) {
+    return page(res, "steer login", `<h1>steer</h1>\n<p>This login didn't work or expired. Run <code>steer login</code> again.</p>`);
+  }
+  byState.delete(state);
+  l.state = null;
+  const info = await hcaUser(authCode);
+  if (!info) return page(res, "steer login", `<h1>steer</h1>\n<p>Hack Club didn't confirm the login. Run <code>steer login</code> again.</p>`);
   if (!info?.sub) return page(res, "steer login", `<h1>steer</h1>\n<p>Hack Club didn't send an account id.</p>`);
 
   // Same Hack Club account as before, or link the account the terminal was already
@@ -1114,8 +1348,21 @@ async function handle(req, res) {
 
   if (req.method === "POST" && path === "/api/events") return postEvents(req, res);
   if (req.method === "POST" && path === "/api/submit") return submitReview(req, res);
-  if (req.method === "GET" && (m = /^\/r\/([^/]+)$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewPage(res, m[1]);
+  if (req.method === "GET" && (m = /^\/r\/([^/]+)$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewPage(req, res, m[1]);
+  if (req.method === "POST" && (m = /^\/r\/([^/]+)\/decide$/.exec(path)) && REVIEW_ID.test(m[1])) return decide(req, res, m[1]);
   if (req.method === "GET" && (m = /^\/api\/r\/([^/]+)$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewJson(res, m[1]);
+  if (req.method === "GET" && (m = /^\/api\/r\/([^/]+)\/events$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewEvents(res, m[1]);
+  if (req.method === "GET" && path === "/reviewer/login") return reviewerLogin(req, res, url.searchParams.get("r") ?? "");
+  if (req.method === "GET" && (m = /^\/api\/slack\/([^/]+)$/.exec(path))) {
+    if (!SLACK_ID.test(m[1])) return json(res, 400, { error: "slack ids look like U0123ABCD" });
+    return slackLookup(res, m[1]);
+  }
+  if (req.method === "GET" && (m = /^\/api\/u\/([^/]+)\/events$/.exec(path))) {
+    const name = decode(m[1]);
+    if (name === null || !hasUser(name)) return json(res, 404, { error: "no such user" });
+    const project = url.searchParams.get("project");
+    return eventsJsonl(res, name, { project: project === null ? null : project.slice(0, 100) });
+  }
 
   if (req.method === "GET" && (m = /^\/u\/([^/]+)(?:\/([^/]+))?\/?$/.exec(path))) {
     const name = decode(m[1]);
@@ -1139,6 +1386,8 @@ async function handle(req, res) {
 function sweep() {
   const now = Date.now();
   sweepLogins();
+  for (const [t, s] of sessions) if (s.until < now) sessions.delete(t);
+  for (const [k, v] of reviewerStates) if (now - v.created > LOGIN_TTL) reviewerStates.delete(k);
   for (const b of [sendLimit, loginStarts, codeTries, signups, submits]) b.sweep(now);
   for (const [name, until] of tooBig) if (until < now) tooBig.delete(name);
   for (const [name, s] of stores) if (s.store && now - s.used > STORE_IDLE) stores.delete(name);

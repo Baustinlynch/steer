@@ -63,7 +63,12 @@ fn save_config(c: &Config) -> Result<(), String> {
 // ---------- talking to the server ----------
 
 pub(crate) fn post(server: &str, path: &str, key: Option<&str>, body: &Value) -> Result<Value, String> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
+    post_waiting(server, path, key, body, 15)
+}
+
+/// `post`, waiting up to `secs` for the answer.
+pub(crate) fn post_waiting(server: &str, path: &str, key: Option<&str>, body: &Value, secs: u64) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(secs)).build();
     let mut req = agent
         .post(&format!("{}{}", server.trim_end_matches('/'), path))
         .set("Content-Type", "application/json");
@@ -823,7 +828,9 @@ fn submit(args: &[String]) -> Result<String, String> {
     if !flushing() {
         let _ = flush();
     }
-    let v = post(&config.server, "/api/submit", Some(&config.key), &body)?;
+    // Making the page can take a while: it works out all your hours and looks your
+    // commits up on GitHub.
+    let v = post_waiting(&config.server, "/api/submit", Some(&config.key), &body, 90)?;
     let s = |k: &str| v[k].as_str().unwrap_or_default().to_owned();
     let mut out = format!("froze {} on {project} ({}h) into a review page:\n  {}\n\nfor unified, paste:\n  {}", s("your_time"), s("hours"), s("url"), s("line"));
     if repo.is_none() {

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'none'; base-uri 'none'">
+<title>steer · faking time</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<h1><a href="/">steer</a> / faking time</h1>
+<p>What steer checks, what it catches, and what it doesn't. Written for fraud squad and program reviewers, but anyone can read it. The code for all of it is at <a href="https://github.com/EwoudVV/steer">github.com/EwoudVV/steer</a>.</p>
+
+<h2>What steer trusts</h2>
+<ul>
+<li><b>When things happened.</b> The server stamps every event when it arrives. An event more than 5 minutes off from that doesn't count, so old logs can't be sent in later and times can't be moved around.</li>
+<li><b>That the person did something.</b> Time only comes from things a person does: a prompt, stopping the agent, a code change while the agent wasn't editing, a commit. The agent running by itself never counts.</li>
+<li><b>Nothing about the prompt text.</b> Prompt text never leaves the person's computer, so there's nothing to fake there either. Only counts are sent, like how many words a prompt had.</li>
+</ul>
+
+<h2>What's checked</h2>
+<table class="list">
+<tr><th>Trick</th><th>What happens</th></tr>
+<tr><td>Sending lots of prompts at once, or pasting long prompts fast</td><td>A prompt never counts more than the time since the person's last action.</td></tr>
+<tr><td>Running several sessions or agents at once</td><td>Time that overlaps is counted once.</td></tr>
+<tr><td>Typing "continue" or "fix it" over and over without testing</td><td>Short prompts count at most 2 minutes. 3 or more in a row without testing count only the typing, at most 30 seconds each.</td></tr>
+<tr><td>Walking away and coming back hours later</td><td>Any gap over 30 minutes is a break: 2 minutes to catch up, 5 if the person tested something, plus typing.</td></tr>
+<tr><td>Leaving it running all day</td><td>At most 12 hours a day and 60 a week count, and the day gets pointed out.</td></tr>
+<tr><td>Saving a file over and over</td><td>A save only counts if the contents changed, the agent wasn't editing, and the files aren't back to how they were in the last hour.</td></tr>
+<tr><td>Making up commits</td><td>Each commit on a review page is looked up on GitHub. A commit that isn't there, or was made at a different time than steer saw, is marked in red.</td></tr>
+<tr><td>A script that prompts the agent the moment it stops</td><td>Pointed out: "replies usually came 8s after the agent stopped".</td></tr>
+<tr><td>A script with a steady rhythm</td><td>Pointed out: "prompts came at very even intervals", and long days without a break.</td></tr>
+<tr><td>Prompts the agent never answered</td><td>Only typing counts, and a day with lots of them gets pointed out.</td></tr>
+</table>
+<p>The pointed out ones show up under Checks on the person's page and on every review page. They aren't automatic bans, since most have honest reasons, like a long hackathon day.</p>
+
+<h2>What it doesn't catch</h2>
+<p>steer can't stop someone who writes their own program to send made-up events with their own key, if the events look like a real person working: uneven gaps, breaks, nights off. In a simulation that copied a real rhythm, a script like that got about 4 hours a day counted, and none of the checks pointed at it. The same goes for any tracker that runs on the person's computer, Hackatime included.</p>
+<p>What gives it away is the project. Made-up hours don't come with code. So on a review page, look at:</p>
+<ul>
+<li>the commits, and whether GitHub has them at the times steer saw</li>
+<li>whether the hours fit what the project is</li>
+<li>days with lots of prompts and no code changes or commits at all</li>
+</ul>
+<p>A script can also make real code changes and real commits. Those end up in the project's history, where they can be seen.</p>
+
+<h2>How the counting was picked</h2>
+<p>Thousands of days of work by different kinds of people (focused, multitasking, careful, mostly prompting) were simulated, matched to real logs. Every counting rule counted the same days and was compared to the real time. The rule steer uses came closest for every kind of person: within about 10 to 15% normally, and 22% in the worst case of everything that was tried. A flat 1/3 of agent time was off by up to 182%. The simulation is <code>tools/sim/simulate.mjs</code> in the repo.</p>
+
+<h2>For reviewers</h2>
+<ul>
+<li>Every submitted project has a review page that never changes after it's made, with a written justification and every action behind the hours.</li>
+<li>Every event behind a review page, with when the server got it, is at <code>/api/r/ID/events</code>.</li>
+<li>Everything steer has for a person, by Slack id: <code>/api/slack/SLACK_ID</code>. All of an account's events: <code>/api/u/NAME/events</code>.</li>
+<li>Fraud squad and program reviewers can sign in on a review page with Hack Club to approve, cut or reject the hours, with a note the person sees. Ask duck to be added.</li>
+</ul>
+</main>
+</body>
+</html>
