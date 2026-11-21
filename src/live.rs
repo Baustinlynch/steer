@@ -238,6 +238,7 @@ pub(crate) fn enqueue(events: &[Value]) -> Option<()> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let _ = fs::write(dir().join("last-activity"), now.to_string());
     }
+    crate::evidence::note(events);
     let mut queue = OpenOptions::new().create(true).append(true).open(dir().join("queue.jsonl")).ok()?;
     let lines: String = events.iter().map(|e| format!("{e}\n")).collect();
     queue.write_all(lines.as_bytes()).ok()
@@ -262,11 +263,23 @@ pub(crate) fn project_name(cwd: &str) -> String {
     let mut d = Some(start);
     while let Some(p) = d {
         if p.join(".git").exists() {
-            return p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let mut roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+            roots.retain(|(n, _)| n != &name);
+            roots.push((name.clone(), p.to_path_buf()));
+            return name;
         }
         d = p.parent();
     }
     start.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "unknown".into())
+}
+
+/// Git repos `project_name` found in this run, by project name, so `evidence::note` can
+/// tell which repos the AI tools were used in.
+static ROOTS: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn known_roots() -> Vec<(String, PathBuf)> {
+    ROOTS.lock().map(|r| r.clone()).unwrap_or_default()
 }
 
 /// Compares the prompt to the previous one in the same session. Only word hashes of the
@@ -767,7 +780,75 @@ pub const HELP: &str = "live tracking:
   steer watch --dry-run [--days N]   show what the watcher would send, as counts
   steer flush                        send waiting events now
 
+  steer submit [PROJECT]             freeze a project's hours into a page for reviewers,
+     [--from DAY] [--to DAY]         and get a line to paste into unified. run it in the
+     [--repo URL]                    project's folder. days look like 2026-11-21
+
 daily update checks are off if ~/.steer/no-update exists or STEER_NO_UPDATE is set";
+
+/// `steer submit [PROJECT] [--from DAY] [--to DAY] [--repo URL]`: freezes a project's
+/// hours into a review page and prints its link and a line to paste into Unified. The
+/// project is the folder you're in unless you name one, and the repo is its GitHub
+/// remote unless you give one.
+fn submit(args: &[String]) -> Result<String, String> {
+    let config = load_config().ok_or("not signed in, run steer login first")?;
+    let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut named = None;
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--from" | "--to" | "--repo" => {
+                it.next();
+            }
+            a if a.starts_with("--") => return Err(format!("unknown option {a}")),
+            a => named = Some(a.to_owned()),
+        }
+    }
+    let here = project_name(&cwd);
+    let project = named.clone().unwrap_or_else(|| here.clone());
+    if project == "home" || project == "unknown" {
+        return Err("run this in your project's folder, or say which project: steer submit NAME".into());
+    }
+    let repo = flag_value(args, "--repo").or_else(|| if project == here { github_remote(&cwd) } else { None });
+    let mut body = json!({ "project": project });
+    for (flag, key) in [("--from", "from"), ("--to", "to")] {
+        if let Some(day) = flag_value(args, flag) {
+            body[key] = day.into();
+        }
+    }
+    if let Some(r) = &repo {
+        body["repo"] = r.as_str().into();
+    }
+    // So the page has everything up to now.
+    if !flushing() {
+        let _ = flush();
+    }
+    let v = post(&config.server, "/api/submit", Some(&config.key), &body)?;
+    let s = |k: &str| v[k].as_str().unwrap_or_default().to_owned();
+    let mut out = format!("froze {} on {project} ({}h) into a review page:\n  {}\n\nfor unified, paste:\n  {}", s("your_time"), s("hours"), s("url"), s("line"));
+    if repo.is_none() {
+        out += "\n\nno github repo found, so commits on the page aren't linked. add one with --repo https://github.com/you/project";
+    }
+    Ok(out)
+}
+
+/// The GitHub page of the folder's `origin` remote, if it's on GitHub.
+fn github_remote(cwd: &str) -> Option<String> {
+    let out = Command::new("git").args(["-C", cwd, "remote", "get-url", "origin"]).output().ok().filter(|o| o.status.success())?;
+    github_url(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+fn github_url(remote: &str) -> Option<String> {
+    let path = remote
+        .strip_prefix("https://github.com/")
+        .or_else(|| remote.strip_prefix("git@github.com:"))
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let (owner, name) = (parts.next()?, parts.next()?);
+    let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    (parts.next().is_none() && ok(owner) && ok(name)).then(|| format!("https://github.com/{owner}/{name}"))
+}
 
 fn flag_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -808,6 +889,7 @@ pub fn command(args: &[String]) -> i32 {
             }
         }
         "status" => Ok(status()),
+        "submit" => submit(args),
         "flush" => flush().map(|n| format!("sent {n} events")),
         _ => Err(format!("unknown command {}", args[0])),
     };
@@ -939,7 +1021,7 @@ pub(crate) fn status() -> String {
         }
     );
     out += &format!(
-        "watcher for codex, opencode and copilot: {}\n",
+        "watcher (codex, opencode, copilot, saves and commits): {}\n",
         if crate::watch::running() { "running" } else { "not running, run steer setup" }
     );
     out += &format!("waiting to send: {} events", queued());
@@ -959,6 +1041,15 @@ pub(crate) fn use_temp_home() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_remotes_become_links() {
+        assert_eq!(github_url("git@github.com:EwoudVV/steer.git").as_deref(), Some("https://github.com/EwoudVV/steer"));
+        assert_eq!(github_url("https://github.com/EwoudVV/steer").as_deref(), Some("https://github.com/EwoudVV/steer"));
+        assert_eq!(github_url("ssh://git@github.com/a/b.git").as_deref(), Some("https://github.com/a/b"));
+        assert_eq!(github_url("https://gitlab.com/a/b"), None);
+        assert_eq!(github_url("https://github.com/a/b/c"), None);
+    }
 
     #[test]
     fn repeat_detection_keeps_the_current_session() {

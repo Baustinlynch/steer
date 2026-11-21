@@ -96,7 +96,9 @@ impl Schedule {
         let start = now / size * size;
         if start != self.block {
             self.block = start;
-            self.at = start + self.random() % size;
+            // Not in the block's last minute, or the watcher (which looks every few
+            // seconds) could miss it and skip the block.
+            self.at = start + self.random() % size.saturating_sub(60).max(1);
             self.done = false;
         }
         if !self.done && now >= self.at {

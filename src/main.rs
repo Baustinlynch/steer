@@ -2,6 +2,7 @@ mod analyze;
 mod checkin;
 mod codex;
 mod copilot;
+mod evidence;
 mod claude;
 mod git;
 mod live;
@@ -104,7 +105,7 @@ fn main() {
         Some("uninstall") => std::process::exit(manage::finish(manage::uninstall(&argv))),
         Some("version" | "--version" | "-V") => return println!("steer {}", manage::VERSION),
         Some("help" | "--help" | "-h") => return println!("{}", help()),
-        Some("signup" | "login" | "setup" | "status" | "flush") => std::process::exit(live::command(&argv)),
+        Some("signup" | "login" | "setup" | "status" | "flush" | "submit") => std::process::exit(live::command(&argv)),
         Some("watch") => {
             if argv.iter().any(|a| a == "--dry-run") {
                 let days = argv.iter().position(|a| a == "--days").and_then(|i| argv.get(i + 1)).and_then(|d| d.parse().ok()).unwrap_or(30);

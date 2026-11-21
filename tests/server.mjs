@@ -146,6 +146,12 @@ try {
     ev({ kind: "checkin", via: "steer", answer: "maybe" }),
     ev({ kind: "checkin", via: "steer", answer: "other", answered_after: -1 }),
     ev({ kind: "stop", via: "steer" }),
+    // Evidence: only from steer, and only the safe fields.
+    ev({ kind: "run", via: "claude-code", name: "npm" }),
+    ev({ kind: "run", via: "steer", name: "npm test --watch" }),
+    ev({ kind: "run", via: "steer", name: "cat", exit: 900 }),
+    ev({ kind: "commit", via: "steer", hash: "not-a-hash" }),
+    ev({ kind: "save", via: "steer", count: 0 }),
     ev({ t: "1" }),
     ev({ t: 1763600000000 }),
     ev({ t: undefined }),
@@ -169,6 +175,10 @@ try {
     ev({ t: iso(Date.now() + 3_600_000) }),
     // A check-in answer from steer itself.
     ev({ kind: "checkin", via: "steer", answer: "project-ai", answered_after: 4 }),
+    // Evidence from the project, also only from steer itself.
+    ev({ kind: "run", via: "steer", name: "npm", exit: 1, secs: 12 }),
+    ev({ kind: "save", via: "steer", count: 3 }),
+    ev({ kind: "commit", via: "steer", hash: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0" }),
   ];
   const mixed = await post(alice, { events: [...bad, ...good] });
   assert.equal(mixed.status, 200);
@@ -246,6 +256,59 @@ try {
   assert.match(project.text, /Showing the newest 100 of 400 sessions/);
   assert.equal(project.text.match(/<details>/g).length, 100);
   assert.equal((await get("/u/big/nope")).status, 404);
+
+  // 9. Review pages: steer submit freezes a project's hours into a page of its own.
+  {
+    const key = (await signup("rev", "10.0.0.20")).body.key;
+    const at = (secs) => iso(Date.now() - secs * 1000);
+    const hash = "0123456789abcdef0123456789abcdef01234567";
+    const sent = await post(key, {
+      events: [
+        prompt({ project: "game2", t: at(240), words: 40, chars: 200, specific: 3 }),
+        ev({ project: "game2", t: at(230) }),
+        ev({ project: "game2", kind: "stop", tool: undefined, t: at(200) }),
+        { id: `id-${n++}`, session: "evidence", project: "game2", via: "steer", kind: "save", count: 2, t: at(150) },
+        { id: `id-${n++}`, session: "evidence", project: "game2", via: "steer", kind: "commit", hash, t: at(120) },
+        prompt({ project: "game2", t: at(60), observation: true }),
+        ev({ project: "game2", kind: "stop", tool: undefined, t: at(30) }),
+      ],
+    });
+    assert.equal(sent.body.accepted, 7);
+    const submit = async (body, k = key) => {
+      const res = await fetch(STEER + "/api/submit", { method: "POST", headers: k ? { authorization: `Bearer ${k}` } : {}, body: JSON.stringify(body) });
+      return { status: res.status, body: await res.json() };
+    };
+    assert.equal((await submit({ project: "game2" }, null)).status, 401);
+    assert.equal((await submit({ project: "game2" }, "wrong")).status, 401);
+    assert.equal((await submit({ project: "game2", from: "21 nov" })).status, 400);
+    assert.equal((await submit({ project: "game2", from: "2026-11-21", to: "2026-11-01" })).status, 400);
+    assert.equal((await submit({ project: "game2", repo: "https://evil.example/a/b" })).status, 400);
+    assert.equal((await submit({ project: "nope" })).status, 404);
+    const tomorrow = iso(Date.now() + 86_400_000).slice(0, 10);
+    assert.equal((await submit({ project: "game2", from: tomorrow })).status, 404, "nothing in those days");
+
+    const made = await submit({ project: "game2", repo: "https://github.com/a/b" });
+    assert.equal(made.status, 201);
+    assert.match(made.body.url, new RegExp(`^${STEER}/r/[A-Za-z0-9_-]{12}$`));
+    assert.equal(made.body.line, `${made.body.hours}h tracked with steer, review: ${made.body.url}`);
+    const path = new URL(made.body.url).pathname;
+    const view = await get(path);
+    assert.equal(view.status, 200);
+    for (const part of ["Review:", "For Unified", "Justification", "By day", "Sessions", `https://github.com/a/b/commit/${hash}`, "steer saw 1 commit, 1 code change made by hand"]) {
+      assert.ok(view.text.includes(part), `the review page has ${part}`);
+    }
+    const info = JSON.parse((await get(`/api${path}`)).text);
+    assert.equal(info.user, "rev");
+    assert.equal(info.project, "game2");
+    assert.equal(info.hours, made.body.hours);
+    assert.equal(info.html, undefined, "the api leaves out the page itself");
+
+    // More work afterwards doesn't change a page that was already submitted.
+    await post(key, { events: [prompt({ project: "game2", t: iso(Date.now()) })] });
+    assert.equal((await get(path)).text, view.text, "frozen");
+    assert.equal((await get("/r/short")).status, 404);
+    assert.equal((await get("/r/../users.json")).status, 404);
+  }
 
   console.log(`server tests passed (big page ${cold.ms} ms, then ${warm.ms} ms cached)`);
 } finally {

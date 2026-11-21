@@ -231,11 +231,37 @@ function stripTag(s, tag) {
 
 const AGENT_TIMEOUT = 600;
 const WATCH_WINDOW = 120;
-const REVIEW_CAP = 600;
-const TESTED_CAP = 1200;
+// The gap rule: the first FULL_AGENT seconds after the agent stops count in full, then
+// less and less, fading over FADE, so a gap never earns more than about FULL_AGENT +
+// FADE. A gap that starts with something you did, or a prompt that says you tested
+// something, keeps FULL_YOU in full. A gap over BREAK_AFTER is a break: BREAK_BACK to
+// catch up (BREAK_BACK_TESTED if you tested) plus typing. Picked with tools/sim, which
+// was matched to real logs, and it was the closest of 14 rules for every kind of person
+// (2026-11-21). To be fitted from check-ins. Same numbers as src/analyze.rs.
+const FULL_AGENT = 60;
+const FULL_YOU = 300;
+const FADE = 240;
 const LOW_INFO_CAP = 120;
+const BREAK_AFTER = 1800;
 const BREAK_BACK = 120;
 const BREAK_BACK_TESTED = 300;
+
+/** The counting rule's numbers, so tools/sim can try other values on exactly this code. */
+export const RULE = {
+  fullAgent: FULL_AGENT,
+  fullYou: FULL_YOU,
+  fade: FADE,
+  lowInfoCap: LOW_INFO_CAP,
+  breakAfter: BREAK_AFTER,
+  breakBack: BREAK_BACK,
+  breakBackTested: BREAK_BACK_TESTED,
+};
+
+/** How much of a gap counts by the curve. Same as gap_credit in src/analyze.rs. */
+export function gapCredit(gap, full, fade = FADE) {
+  if (gap <= full) return Math.max(0, gap);
+  return full + Math.round(fade * (1 - Math.exp(-(gap - full) / fade)));
+}
 const LOOP_GAP = 900;
 const LOOP_MIN = 3;
 const FIRST_PROMPT_MAX = 120;
@@ -273,7 +299,7 @@ function segment(ev, from, to, start) {
   return seg;
 }
 
-export function analyzeSession(session) {
+export function analyzeSession(session, rule = RULE) {
   const ev = session.events;
   const start = ev.length ? ev[0].t : Date.now();
   const humans = [];
@@ -335,20 +361,21 @@ export function analyzeSession(session) {
           why = { rule: "noreply", wall: prev.wall };
         } else {
           const { gap, wall } = prev;
-          const cap = p.generic ? LOW_INFO_CAP : tested ? TESTED_CAP : REVIEW_CAP;
-          if (gap > cap) {
-            const back = tested ? BREAK_BACK_TESTED : BREAK_BACK;
-            human = Math.min(typed + back, Math.max(cap, typed), wall);
-            why = { rule: "break", gap, cap, back };
+          if (gap > rule.breakAfter) {
+            const back = tested ? rule.breakBackTested : rule.breakBack;
+            human = Math.min(typed + back, wall);
+            why = { rule: "break", gap, back };
           } else {
+            const full = tested || !prev.fromAgent ? rule.fullYou : rule.fullAgent;
             // Replying fast means you watched the agent work, but not for a bare "ok".
             const watch = gap <= WATCH_WINDOW && !p.generic ? Math.min(prev.agentPrev, WATCH_WINDOW) : 0;
-            const reply = gap + watch;
-            const want = Math.max(reply, typed);
+            let credit = gapCredit(gap, full, rule.fade) + watch;
+            if (p.generic) credit = Math.min(credit, rule.lowInfoCap);
+            const want = Math.max(credit, typed);
             human = Math.min(want, wall);
             if (human < want) why = { rule: "wall", wall };
-            else if (typed > reply) why = { rule: "typing", gap, watch };
-            else why = { rule: "reply", gap, watch, cap };
+            else if (typed > credit) why = { rule: "typing", gap, watch };
+            else why = { rule: "gap", gap, watch, full, lowInfo: p.generic };
           }
         }
         isLoopy = (p.generic || repeat) && !tested;
@@ -372,6 +399,28 @@ export function analyzeSession(session) {
       case "rejected":
         [human, why] = clamped(prev ? prev.gap : null, 10, 10, 60);
         break;
+      // Evidence from the project (steer's watcher and terminal lines): a command you
+      // ran, files saved while the agent wasn't editing, a commit. The gap before it
+      // counts by the same curve; if it started with something you did, the first
+      // FULL_YOU in full.
+      case "run":
+      case "save":
+      case "commit":
+        if (e.kind === "run") ranCommand = true;
+        if (!prev) {
+          human = 10;
+          why = { rule: "first" };
+        } else {
+          const full = prev.fromAgent ? rule.fullAgent : rule.fullYou;
+          if (prev.gap > rule.breakAfter) {
+            human = Math.min(rule.breakBack, prev.gap);
+            why = { rule: "break", gap: prev.gap, back: rule.breakBack };
+          } else {
+            human = gapCredit(prev.gap, full, rule.fade);
+            why = { rule: "evidence", gap: prev.gap, full };
+          }
+        }
+        break;
     }
 
     turns.push({
@@ -394,6 +443,9 @@ export function analyzeSession(session) {
       // Time past the daily or weekly payable cap, and which one. Set by applyCaps.
       capped: 0,
       cap: null,
+      // For evidence: the command's name and exit code, or how many files were saved.
+      detail:
+        e.kind === "run" ? { name: e.name, exit: e.exit } : e.kind === "save" ? { count: e.count ?? 1 } : e.kind === "commit" ? { hash: e.hash ?? null } : null,
     });
     loopy.push(isLoopy);
     typing.push(typed);
@@ -488,12 +540,46 @@ function projectName(cwd) {
   return parts.length ? parts[parts.length - 1] : cwd;
 }
 
+// Evidence counts as part of the AI session it happened during or right after.
+const EVIDENCE_REACH = 2 * 3600 * 1000;
+
+/**
+ * Evidence from the project (sessions marked `evidence`, one per project, from the
+ * server) goes into the AI session of the same project that was most recently active
+ * when it happened, so it splits that session's gaps. Evidence with no AI session
+ * nearby stays in its own session. Doesn't change the sessions passed in.
+ */
+function mergeEvidence(sessions) {
+  const ai = sessions.filter((s) => !s.evidence).map((s) => ({ ...s, events: [...s.events] }));
+  const out = [...ai];
+  for (const ev of sessions.filter((s) => s.evidence)) {
+    const name = projectName(ev.cwd);
+    const mine = ai.filter((s) => projectName(s.cwd) === name && s.events.length);
+    const alone = [];
+    for (const e of ev.events) {
+      let best = null;
+      for (const s of mine) {
+        const before = s.events.filter((x) => x.kind !== "run" && x.kind !== "save" && x.kind !== "commit" && x.t <= e.t);
+        if (!before.length || e.t > s.events[s.events.length - 1].t + EVIDENCE_REACH) continue;
+        const last = before[before.length - 1].t;
+        if (!best || last > best.last) best = { s, last };
+      }
+      if (best) best.s.events.push(e);
+      else alone.push(e);
+    }
+    if (alone.length) out.push({ ...ev, events: alone });
+  }
+  for (const s of out) s.events.sort((a, b) => a.t - b.t);
+  return out;
+}
+
 /**
  * sessions: output of SessionReader.finish(). Doesn't change them.
  * Resumed or forked sessions copy old entries into a new file, so sessions are
  * gone through oldest first and each entry only counts the first time it shows up.
  */
-export function buildReport(sessions, { days = 30, now = Date.now() } = {}) {
+export function buildReport(sessions, { days = 30, now = Date.now(), rule = RULE } = {}) {
+  sessions = mergeEvidence(sessions);
   const ordered = [...sessions]
     .sort((a, b) => comparePaths(a.path, b.path))
     .sort((a, b) => a.events[0].t - b.events[0].t);
@@ -505,7 +591,7 @@ export function buildReport(sessions, { days = 30, now = Date.now() } = {}) {
     const events = s.events.filter((e) => e.id === null || (!seen.has(e.id) && seen.add(e.id)));
     if (events.length === 0) continue;
     if (cutoff !== null && events[events.length - 1].t < cutoff) continue;
-    const rep = analyzeSession({ ...s, events });
+    const rep = analyzeSession({ ...s, events }, rule);
     if (rep.turns.length === 0) continue;
     const name = projectName(s.cwd);
     if (!byName.has(name)) byName.set(name, { name, sessions: [] });
@@ -545,6 +631,13 @@ const ACTIONS = {
   shell: "Ran command",
   command: "Slash command",
   rejected: "Rejected tool call",
+  save: "Saved files",
+  commit: "Committed",
+};
+const actionOf = (t) => {
+  if (t.kind === "prompt") return `Prompt (${plural(t.words, "word")})`;
+  if (t.kind === "run") return `Ran ${esc(t.detail?.name ?? "a command")}${t.detail?.exit ? " (failed)" : ""}`;
+  return ACTIONS[t.kind] ?? t.kind;
 };
 
 // ---------- rules a server can change ----------
@@ -662,7 +755,7 @@ export function checks(projects, rules = DEFAULT_RULES) {
       notes.push(`${tooFast} of ${prompts.length} prompts came faster than they could be typed`);
     }
 
-    const replies = prompts.filter((t) => t.fromAgent && (t.why.rule === "reply" || t.why.rule === "typing")).map((t) => t.why.gap);
+    const replies = prompts.filter((t) => t.fromAgent && (t.why.rule === "gap" || t.why.rule === "typing")).map((t) => t.why.gap);
     if (replies.length >= c.minReplies) {
       replies.sort((a, b) => a - b);
       const median = replies[Math.floor(replies.length / 2)];
@@ -687,6 +780,161 @@ function renderChecks(projects, rules) {
   h += `<p class="muted">Things a reviewer might want to look at. Most have honest reasons, like a long hackathon day or running two agents at once.</p>\n<ul>\n`;
   for (const { day, notes } of found) h += `<li>${day}: ${notes.map(esc).join(", ")}</li>\n`;
   return h + "</ul>\n";
+}
+
+// ---------- review page ----------
+
+const utcDate = (t) => new Date(t).toISOString().slice(0, 10);
+const niceDay = (day) => {
+  const [y, m, d] = day.split("-").map(Number);
+  return `${MONTHS[m - 1]} ${d}, ${y}`;
+};
+
+/**
+ * A project cut down to the turns between two UTC days, both included ("YYYY-MM-DD",
+ * or null for no limit). Run applyCaps on the whole report first, since the caps are
+ * per person and day.
+ */
+export function projectBetween(p, from, to) {
+  const lo = from ? Date.parse(`${from}T00:00:00Z`) : -Infinity;
+  const hi = to ? Date.parse(`${to}T00:00:00Z`) + 86400000 : Infinity;
+  const sessions = [];
+  for (const s of p.sessions) {
+    const turns = s.turns.filter((t) => t.t >= lo && t.t < hi);
+    if (turns.length) sessions.push({ ...s, turns, start: turns[0].t });
+  }
+  return { ...p, sessions };
+}
+
+/** The numbers a review page is made of. */
+export function reviewFacts(p) {
+  const turns = p.sessions.flatMap((s) => s.turns);
+  const prompts = turns.filter((t) => t.kind === "prompt");
+  const days = new Map();
+  for (const t of turns) {
+    const day = utcDate(t.t);
+    if (!days.has(day)) days.set(day, { day, you: 0, agent: 0, prompts: 0, commits: 0, changes: 0, runs: 0 });
+    const d = days.get(day);
+    d.you += t.human;
+    d.agent += t.agent;
+    if (t.kind === "prompt") d.prompts++;
+    if (t.kind === "commit") d.commits++;
+    if (t.kind === "save") d.changes++;
+    if (t.kind === "run") d.runs++;
+  }
+  const byDay = [...days.values()].sort((a, b) => (a.day < b.day ? -1 : 1));
+  return {
+    you: projectHuman(p),
+    agent: projectAgent(p),
+    flagged: projectFlagged(p),
+    overlap: projectOverlap(p),
+    capped: sum(p.sessions, (s) => s.turns.reduce((n, t) => n + (t.capped ?? 0), 0)),
+    sessions: p.sessions.filter((s) => s.turns.some((t) => t.kind === "prompt")).length,
+    days: byDay.filter((d) => d.you > 0).length,
+    first: byDay.length ? byDay[0].day : null,
+    last: byDay.length ? byDay[byDay.length - 1].day : null,
+    prompts: prompts.length,
+    specific: prompts.filter((t) => t.tags.includes("specific")).length,
+    tested: prompts.filter((t) => testedHow(t) !== null).length,
+    lowInfo: prompts.filter((t) => t.tags.includes("low info")).length,
+    commits: turns
+      .filter((t) => t.kind === "commit")
+      .map((t) => ({ t: t.t, hash: t.detail?.hash ?? null }))
+      .sort((a, b) => a.t - b.t),
+    changes: turns.filter((t) => t.kind === "save").length,
+    runs: turns.filter((t) => t.kind === "run").length,
+    byDay,
+  };
+}
+
+const share = (n, of) => `${of ? Math.round((100 * n) / of) : 0}%`;
+/** Hours with one decimal, the way programs write them down. */
+export const hoursOf = (secs) => (Math.round(secs / 360) / 10).toFixed(1);
+
+/** The written justification for a review, as plain text. */
+export function justification(name, project, f, found) {
+  const span = f.first ? (f.first === f.last ? `on ${niceDay(f.first)}` : `from ${niceDay(f.first)} to ${niceDay(f.last)}`) : "";
+  const lines = [];
+  lines.push(
+    `steer counted ${fmtDur(f.you)} of ${name}'s own time on ${project} ${span}, over ${plural(f.days, "day")} and ${plural(f.sessions, "session")} with an AI agent. ` +
+      `That's the time spent writing ${plural(f.prompts, "prompt")}, reading and testing what the agent did, and changing code by hand. ` +
+      `The ${fmtDur(f.agent)} the agent ran by itself isn't counted.`,
+  );
+  if (f.prompts) {
+    let l = `${share(f.specific, f.prompts)} of the prompts named files or code, and ${share(f.tested, f.prompts)} came after testing (a screenshot, a description of what happened, or a command run first).`;
+    if (f.lowInfo) l += ` ${share(f.lowInfo, f.prompts)} were short ones like "continue", which count at most 2 minutes each.`;
+    lines.push(l);
+  }
+  const seen = [];
+  if (f.commits.length) seen.push(plural(f.commits.length, "commit"));
+  if (f.changes) seen.push(`${plural(f.changes, "code change")} made by hand`);
+  if (f.runs) seen.push(plural(f.runs, "command") + " run in a terminal");
+  if (seen.length) lines.push(`steer saw ${seen.join(", ")} as they happened.`);
+  const left = [];
+  if (f.flagged) left.push(`${fmtDur(f.flagged)} of "continue" loops without testing`);
+  if (f.overlap) left.push(`${fmtDur(f.overlap)} that overlapped another session and was counted once`);
+  if (f.capped) left.push(`${fmtDur(f.capped)} past the daily or weekly cap`);
+  if (left.length) lines.push(`Left out: ${left.join(", ")}.`);
+  lines.push(
+    found.length
+      ? `Checks: ${found.map(({ day, notes }) => `${day}: ${notes.join(", ")}`).join("; ")}.`
+      : "Checks: nothing stood out.",
+  );
+  return lines.join("\n\n");
+}
+
+/**
+ * A frozen review page for one project. `info`: { name, slack, verified, from, to,
+ * frozen, url, repo }. `found` is checks() for the days in the review. `facts` is
+ * reviewFacts of the whole project, when only some of its sessions are passed in to draw.
+ */
+export function renderReview(p, info, found, rules = DEFAULT_RULES, facts = null) {
+  const f = facts ?? reviewFacts(p);
+  const repo = typeof info.repo === "string" && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(info.repo) ? info.repo : null;
+  const text = justification(info.name, p.name, f, found);
+  const line = `${hoursOf(f.you)}h tracked with steer, review: ${info.url}`;
+  const who = info.slack ? `Hack Club account ${esc(info.slack)}${info.verified ? " (verified)" : ""}` : "not linked to a Hack Club account";
+  const range = `${info.from ? niceDay(info.from) : "the start"} to ${info.to ? niceDay(info.to) : niceDay(utcDate(info.frozen))}`;
+  let h = `<p class="muted">Frozen ${esc(new Date(info.frozen).toUTCString())}, so it won't change. Hours from ${range} (UTC), ${who}.</p>
+<h2>Hours</h2>
+<table class="totals">
+<tr><th>Counted</th><td>${fmtDur(f.you)} (${hoursOf(f.you)}h)</td></tr>
+<tr><th>Agent ran by itself (not counted)</th><td>${fmtDur(f.agent)}</td></tr>
+<tr><th>"Continue" loops (not counted)</th><td>${fmtDur(f.flagged)}</td></tr>
+<tr><th>Sessions at the same time (counted once)</th><td>${fmtDur(f.overlap)}</td></tr>
+${f.capped ? `<tr><th>Past the ${rules.dailyCapHours}h a day or ${rules.weeklyCapHours}h a week cap (not counted)</th><td>${fmtDur(f.capped)}</td></tr>\n` : ""}</table>
+<h2>For Unified</h2>
+<p><code>${esc(line)}</code></p>
+<h2>Justification</h2>
+${text.split("\n\n").map((l) => `<p>${esc(l)}</p>`).join("\n")}
+<h2>Checks</h2>
+`;
+  if (!found.length) h += "<p>Nothing stood out.</p>\n";
+  else {
+    h += `<p class="muted">Things to look at. Most have honest reasons, like a long hackathon day or two agents at once.</p>\n<ul>\n`;
+    for (const { day, notes } of found) h += `<li>${day}: ${notes.map(esc).join(", ")}</li>\n`;
+    h += "</ul>\n";
+  }
+  h += `<h2>By day</h2>
+<div class="scroll"><table class="list">
+<tr><th>Day (UTC)</th><th class="r">Counted</th><th class="r">Agent</th><th class="r">Prompts</th><th class="r">Commits</th><th class="r">Code changes</th><th class="r">Commands</th></tr>
+`;
+  for (const d of f.byDay) {
+    h += `<tr><td>${niceDay(d.day)}</td><td class="r">${fmtDur(d.you)}</td><td class="r">${fmtDur(d.agent)}</td><td class="r">${d.prompts}</td><td class="r">${d.commits}</td><td class="r">${d.changes}</td><td class="r">${d.runs}</td></tr>\n`;
+  }
+  h += "</table></div>\n";
+  if (f.commits.length) {
+    h += `<h2>Commits</h2>\n<p class="muted">Seen by steer when they were made.${repo ? " Each links to it on GitHub, so you can check it's there and what it changed." : " No GitHub repo was given, so compare these with the project's git log."}</p>\n<div class="scroll"><table class="list">\n<tr><th>When (UTC)</th><th>Commit</th></tr>\n`;
+    for (const c of f.commits) {
+      const when = new Date(c.t).toISOString().slice(0, 16).replace("T", " ");
+      const hash = c.hash ? (repo ? `<a href="${esc(`${repo}/commit/${c.hash}`)}">${esc(c.hash.slice(0, 12))}</a>` : `<code>${esc(c.hash.slice(0, 12))}</code>`) : "";
+      h += `<tr><td>${when}</td><td>${hash}</td></tr>\n`;
+    }
+    h += "</table></div>\n";
+  }
+  h += `<h2>Sessions</h2>\n<p class="muted">Every action steer saw, and why it got its time (hover a note for the whole reason). In each bar, black is the person's time, gray is agent time and red is a "continue" loop.</p>\n`;
+  for (const s of p.sessions) h += renderSession(s, false);
+  return h + HOW;
 }
 
 /** The report itself, as an HTML fragment. */
@@ -764,7 +1012,7 @@ function renderSession(s, hideTitles) {
   for (const t of s.turns) {
     const d = new Date(t.t);
     const when = dayKey(d) === startDay ? hm(d) : fullDate(d);
-    const action = t.kind === "prompt" ? `Prompt (${plural(t.words, "word")})` : ACTIONS[t.kind];
+    const action = actionOf(t);
     const note = turnNote(t);
     const before = t.human + t.flagged + t.overlap + (t.capped ?? 0);
     const you = before !== t.human ? `${fmtDur(t.human)} (was ${fmtDur(before)})` : fmtDur(t.human);
@@ -815,11 +1063,6 @@ export function turnNote(t) {
   const since = t.fromAgent ? "after the agent stopped" : "after your last action";
   const shortPrompt = t.tags.includes("low info");
   const tested = testedHow(t);
-  const capWhy = (cap) => {
-    if (cap === TESTED_CAP && tested) return ` it's ${exact(cap)} because ${tested}.`;
-    if (cap === LOW_INFO_CAP) return ` it's ${exact(cap)} because it's a short prompt like "continue".`;
-    return "";
-  };
   const w = t.why;
   let short;
   let long;
@@ -834,27 +1077,30 @@ export function turnNote(t) {
     short = `first action, counts ${ago(base)}`;
     long = `nothing before it to measure from, so it gets a flat ${exact(base)}.`;
   } else if (w.rule === "break") {
-    const came = `your prompt came ${exact(w.gap)} ${since}`;
-    if (base === t.typed + w.back) {
-      short = tested ? `back after a break, tested: ${ago(w.back)} + typing` : `back after a break: ${ago(w.back)} + typing`;
-      long = `${came}, over the ${exact(w.cap)} max, so it counts as a break. we can't tell when you came back, so ${exact(w.back)} to catch up plus typing (${exact(t.typed)}) counts.`;
-      if (tested) long += ` the max is ${exact(w.cap)} and catch-up is ${exact(w.back)} because ${tested}.`;
-    } else if (base > t.typed) {
-      short = shortPrompt ? `short prompt after a break, capped at ${ago(w.cap)}` : `back after a break, capped at ${ago(w.cap)}`;
-      long = `${came}, over the ${exact(w.cap)} max.${capWhy(w.cap)}`;
-    } else {
-      short = "typing time, longer than the max";
-      long = `${came}, over the ${exact(w.cap)} max, but typing it takes about ${exact(t.typed)}.`;
-    }
-  } else if (w.rule === "reply" && w.watch > 0) {
+    const isPrompt = t.kind === "prompt";
+    const what = isPrompt ? "your prompt" : ({ run: "the command", save: "the save", commit: "the commit" }[t.kind] ?? "this");
+    short = isPrompt ? `back after a break: ${ago(w.back)} + typing` : `back after a break: ${ago(w.back)}`;
+    long = `${what} came ${exact(w.gap)} ${since}, over ${exact(BREAK_AFTER)}, so it counts as a break. we can't tell when you came back, so ${exact(w.back)} to catch up${isPrompt ? ` plus typing (${exact(t.typed)})` : ""} counts.`;
+  } else if (w.rule === "gap" && w.watch > 0) {
     short = `replied ${ago(w.gap)} ${since} + ${ago(w.watch)} watching`;
     long = `you replied ${exact(w.gap)} ${since}. that's within ${exact(WATCH_WINDOW)}, so you were probably watching it work, and ${exact(w.watch)} of its run time counts too.`;
-  } else if (w.rule === "reply") {
-    short = tested && w.gap > REVIEW_CAP ? `tested, replied ${ago(w.gap)} ${since}` : `replied ${ago(w.gap)} ${since}`;
-    long = t.fromAgent
-      ? `the ${exact(w.gap)} between the agent stopping and your prompt counts, up to ${exact(w.cap)}.`
-      : `the agent didn't do anything after your last action, so the ${exact(w.gap)} since then counts, up to ${exact(w.cap)}.`;
-    long += capWhy(w.cap);
+  } else if (w.rule === "gap") {
+    if (base >= w.gap) short = `replied ${ago(w.gap)} ${since}`;
+    else if (w.lowInfo) short = `short prompt ${ago(w.gap)} ${since}, counts ${ago(base)}`;
+    else if (tested) short = `tested, ${ago(w.gap)} ${since}, counts ${ago(base)}`;
+    else short = `${ago(w.gap)} ${since}, counts ${ago(base)}`;
+    long = `you replied ${exact(w.gap)} ${since}. the longer a gap, the less of it counts: the first ${exact(w.full)} in full, then less and less, so ${exact(base)} of it counts.`;
+    if (w.full === FULL_YOU) {
+      long += tested
+        ? ` it's ${exact(w.full)} in full because ${tested}.`
+        : ` it's ${exact(w.full)} in full because the gap started with something you did.`;
+    }
+    if (w.lowInfo) long += ` short prompts like "continue" count at most ${exact(LOW_INFO_CAP)}.`;
+    long += " these numbers come from a simulation matched to real logs, and will be fitted from check-in answers.";
+  } else if (w.rule === "evidence") {
+    const what = { run: "you ran a command in the project", save: "you saved files in the project", commit: "you committed" }[t.kind];
+    short = base >= w.gap ? `${ago(w.gap)} ${since}` : `${ago(w.gap)} ${since}, counts ${ago(base)}`;
+    long = `${what} ${exact(w.gap)} ${since}. the first ${exact(w.full)} of a gap count in full, then less and less, so ${exact(base)} counts.`;
   } else if (w.rule === "typing") {
     short = "typing time, longer than the wait";
     long = `you replied ${exact(w.gap)} ${since}${w.watch > 0 ? ` (+${exact(w.watch)} watching)` : ""}, but typing it takes about ${exact(t.typed)}, so typing time counts.`;
@@ -897,8 +1143,10 @@ export function turnNote(t) {
 const HOW = `<h2>How it counts</h2>
 <ul>
 <li>Your time comes from things you do: prompts, stopping the agent, rejecting a tool call, running a command.</li>
-<li>Time between the agent finishing and your next prompt counts, up to 10 min. Up to 20 min if the prompt has a screenshot, describes what happened, or you ran a command first. Up to 2 min for short prompts like "continue" (3 words or less with no file names, numbers or code).</li>
-<li>A longer gap is a break. Then only 2 min plus typing time counts (5 min if you tested something). Short prompts get 2 min at most.</li>
+<li>Time between the agent finishing and your next prompt counts, but the longer the gap, the less of it counts: the first minute in full, then less and less, up to about 5 min. If the gap started with something you did, or the prompt has a screenshot, describes what happened, or you ran a command first, the first 5 min count in full (up to about 9 min). A gap over 30 min is a break: 2 min to catch up (5 min if you tested) plus typing.</li>
+<li>Short prompts like "continue" (3 words or less with no file names, numbers or code) count at most 2 min.</li>
+<li>Commands you run in your project, files you save while the agent isn't editing, and your commits count as things you did, so the time around them counts like the time before a prompt.</li>
+<li>These numbers were picked by simulating thousands of days of work, matched to real logs, and taking the rule that came closest to the real time. They'll be fitted from check-in answers (steer checkin on).</li>
 <li>If you reply within 2 min of the agent finishing, up to 2 min of agent time counts too.</li>
 <li>Typing time is guessed from how long the prompt is, about 48 words a minute, between 5s and 5 min.</li>
 <li>A prompt never counts more than the time since your last action. The first prompt of a session, or one right after a prompt the agent never answered, only counts typing time, up to 2 min.</li>

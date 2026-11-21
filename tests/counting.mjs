@@ -4,7 +4,7 @@
 //   node tests/counting.mjs
 
 import assert from "node:assert/strict";
-import { analyzePrompt, applyCaps, buildReport, checks, projectHuman, projectOverlap, rulesFrom } from "../web/steer.js";
+import { analyzePrompt, applyCaps, buildReport, checks, gapCredit, projectHuman, projectOverlap, rulesFrom } from "../web/steer.js";
 
 const T0 = Date.UTC(2026, 10, 20, 15, 0, 0);
 const sec = (s) => T0 + s * 1000;
@@ -79,8 +79,9 @@ const honest = () => {
 // works about 5 min after each and you read and test for the 560 s after that.
 {
   const r = total([session("normal", honest())]);
-  // first prompt: 75 s of typing, then 5 replies of 560 s each
-  assert.equal(r, 75 + 5 * 560, `honest session counted ${r}s`);
+  // first prompt: 75 s of typing, then 5 gaps of 560 s after the agent stops, each
+  // counted by rule v1's curve (the first minute in full, then less and less)
+  assert.equal(r, 75 + 5 * gapCredit(560, 60), `honest session counted ${r}s`);
 }
 
 // 8. Checks a reviewer sees. A script that runs for 2 days with a real looking rhythm
@@ -121,11 +122,12 @@ const reportOf = (sessions) => buildReport(sessions, { days: null, now: sec(10 *
   for (let s = 0; s < 7 * 86400; ) {
     events.push(prompt(s, 400));
     events.push(agent(s + 60));
-    s += 60 + 400 + Math.round(rand() * 120);
+    s += 60 + 200 + Math.round(rand() * 120);
   }
   const report = reportOf([session("week", events)]);
   const before = report.reduce((n, p) => n + projectHuman(p), 0);
   applyCaps(report, rulesFrom());
+  assert.ok(report.some((p) => p.sessions.some((x) => x.turns.some((t) => t.capped > 0))), "the caps cut something");
   const turns = report.flatMap((p) => p.sessions.flatMap((s) => s.turns));
   const perDay = new Map();
   for (const t of turns) perDay.set(new Date(t.t).toISOString().slice(0, 10), (perDay.get(new Date(t.t).toISOString().slice(0, 10)) ?? 0) + t.human);
@@ -166,6 +168,31 @@ assert.deepEqual(checks(reportOf([session("normal", honest())])), []);
   assert.equal(p.words, 4);
   assert.ok(p.specific <= p.words + 2);
   assert.equal(analyzePrompt("fix the jump", 0).words, 3);
+}
+
+// 12. Evidence from the project. The same honest session, but in each gap you ran tests
+// and saved files every couple of minutes: now nearly all of it counts. Evidence with no
+// AI session nearby still counts the time between its pieces.
+{
+  const evidence = [];
+  for (let k = 0; k < 5; k++) {
+    const stop = k * 840 + 280;
+    for (let a = 120; a < 560; a += 120) {
+      evidence.push({ id: `ev${k}-${a}`, t: sec(stop + a), kind: a % 240 ? "save" : "run", name: "npm", exit: 0 });
+    }
+  }
+  const withEvidence = total([session("normal", honest()), { path: "evidence:game", cwd: "/home/x/game", title: null, evidence: true, events: evidence }]);
+  const without = total([session("normal", honest())]);
+  assert.ok(withEvidence > without + 5 * 120, `evidence added only ${withEvidence - without}s`);
+  // 20 gaps of 840 s each, so nothing in between: 2 h 20 min of wall time.
+  assert.ok(withEvidence <= 75 + 5 * 840, "never more than the real time");
+
+  // Saves alone, 3 minutes apart for an hour, with no AI session: an hour minus the
+  // first gap's start, counted in full since each gap starts with something you did.
+  const saves = [];
+  for (let m = 0; m <= 60; m += 3) saves.push({ id: `s${m}`, t: sec(10 * 86400 - 7200 + m * 60), kind: "save" });
+  const alone = total([{ path: "evidence:other", cwd: "/home/x/other", title: null, evidence: true, events: saves }]);
+  assert.ok(alone >= 3600 - 60 && alone <= 3600 + 10, `an hour of saves counted ${alone}s`);
 }
 
 console.log("counting tests passed");

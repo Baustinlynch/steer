@@ -12,18 +12,22 @@ const AGENT_TIMEOUT: i64 = 600;
 /// If you reply within this long after the agent finishes, you were watching it work,
 /// and up to this much of its runtime counts as reading along.
 pub const WATCH_WINDOW: i64 = 120;
-/// Longest gap counted as reviewing before a normal prompt.
-pub const REVIEW_CAP: i64 = 600;
-/// Longer cap when the prompt shows you tested something (screenshot, reported result,
-/// or you ran a command first).
-pub const TESTED_CAP: i64 = 1200;
-/// Short cap before low-info prompts like "continue".
+/// The gap before a prompt: the longer it is, the less of it counts. The first FULL_AGENT
+/// seconds after the agent stops count in full, then each further second counts a bit
+/// less, fading over FADE seconds, so a gap never earns more than about FULL_AGENT + FADE.
+/// A gap that started with something you did, or a prompt that says you tested
+/// something, keeps FULL_YOU in full. A gap over BREAK_AFTER is a break: BREAK_BACK to
+/// catch up (BREAK_BACK_TESTED if you tested) plus typing. Picked with tools/sim, which
+/// was matched to real logs (2026-11-21), to be fitted from check-in answers. Same
+/// numbers as web/steer.js.
+pub const FULL_AGENT: i64 = 60;
+pub const FULL_YOU: i64 = 300;
+pub const FADE: i64 = 240;
+pub const BREAK_AFTER: i64 = 1800;
+pub const BREAK_BACK: i64 = 120;
+pub const BREAK_BACK_TESTED: i64 = 300;
+/// Most a low-info prompt like "continue" counts.
 pub const LOW_INFO_CAP: i64 = 120;
-/// After a gap longer than the cap (a break), we can't tell when you came back, so only
-/// a short re-read plus typing counts.
-const BREAK_BACK: i64 = 120;
-/// Same, when the prompt shows you tested something after coming back.
-const BREAK_BACK_TESTED: i64 = 300;
 /// Low-info or repeated prompts closer together than this can form a dark-flow loop.
 pub const LOOP_GAP: i64 = 900;
 /// How many in a row before it's flagged.
@@ -51,10 +55,12 @@ pub enum TurnKind {
 pub enum Why {
     /// First action of the session, so there's nothing before it to measure from.
     First,
-    /// Prompt after a gap longer than its cap: a catch-up time plus typing.
-    Break { gap: i64, cap: i64, back: i64 },
-    /// Prompt within the cap: the gap, plus `watch` of agent time if you replied fast.
-    Reply { gap: i64, watch: i64, cap: i64 },
+    /// Prompt credited by the gap curve: `full` seconds of the gap in full, then less and
+    /// less, plus `watch` of agent time if you replied fast. `low_info` prompts count at
+    /// most LOW_INFO_CAP.
+    Gap { gap: i64, watch: i64, full: i64, low_info: bool },
+    /// Prompt after a gap over BREAK_AFTER: `back` to catch up plus typing.
+    Break { gap: i64, back: i64 },
     /// Prompt where typing it takes longer than the wait.
     Typing { gap: i64, watch: i64 },
     /// Prompt cut down to the time since your last action.
@@ -224,33 +230,29 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
                     // The agent never answered the last prompt, so there was nothing to
                     // review or test: only typing counts.
                     Some((_, _, wall, false)) if after_prompt => (typed.min(FIRST_PROMPT_MAX).min(wall), Why::NoReply { wall }),
-                    Some((gap, agent_prev, wall, _)) => {
-                        let cap = if p.generic {
-                            LOW_INFO_CAP
-                        } else if tested {
-                            TESTED_CAP
-                        } else {
-                            REVIEW_CAP
-                        };
-                        if gap > cap {
-                            let back = if tested { BREAK_BACK_TESTED } else { BREAK_BACK };
-                            ((typed + back).min(cap.max(typed)).min(wall), Why::Break { gap, cap, back })
-                        } else {
-                            // Replying fast means you watched the agent work, but not for a
-                            // bare "ok" or "continue": that's an approval, not reading.
-                            let watch = if gap <= WATCH_WINDOW && !p.generic { agent_prev.min(WATCH_WINDOW) } else { 0 };
-                            let reply = gap + watch;
-                            let want = reply.max(typed);
-                            let secs = want.min(wall);
-                            let why = if secs < want {
-                                Why::Wall { wall }
-                            } else if typed > reply {
-                                Why::Typing { gap, watch }
-                            } else {
-                                Why::Reply { gap, watch, cap }
-                            };
-                            (secs, why)
+                    Some((gap, _, wall, _)) if gap > BREAK_AFTER => {
+                        let back = if tested { BREAK_BACK_TESTED } else { BREAK_BACK };
+                        ((typed + back).min(wall), Why::Break { gap, back })
+                    }
+                    Some((gap, agent_prev, wall, after_agent)) => {
+                        let full = if tested || !after_agent { FULL_YOU } else { FULL_AGENT };
+                        // Replying fast means you watched the agent work, but not for a
+                        // bare "ok" or "continue": that's an approval, not reading.
+                        let watch = if gap <= WATCH_WINDOW && !p.generic { agent_prev.min(WATCH_WINDOW) } else { 0 };
+                        let mut credit = gap_credit(gap, full) + watch;
+                        if p.generic {
+                            credit = credit.min(LOW_INFO_CAP);
                         }
+                        let want = credit.max(typed);
+                        let secs = want.min(wall);
+                        let why = if secs < want {
+                            Why::Wall { wall }
+                        } else if typed > credit {
+                            Why::Typing { gap, watch }
+                        } else {
+                            Why::Gap { gap, watch, full, low_info: p.generic }
+                        };
+                        (secs, why)
                     }
                 };
                 is_loopy = (p.generic || repeat) && !tested;
@@ -306,6 +308,16 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
 
     mark_dark_flow(&mut turns, &loopy, &typing);
     SessionReport { title: session.title.clone(), start, turns }
+}
+
+/// How much of a gap counts by the curve: all of the first `full` seconds, then less and
+/// less, fading over FADE. Never shrinks as the gap grows, and stays under full + FADE.
+pub fn gap_credit(gap: i64, full: i64) -> i64 {
+    if gap <= full {
+        return gap.max(0);
+    }
+    let fade = FADE as f64;
+    full + (fade * (1.0 - (-((gap - full) as f64) / fade).exp())).round() as i64
 }
 
 /// Time for actions other than prompts: `since` kept between `min` and `max`, or a flat
@@ -483,8 +495,25 @@ mod tests {
             prompt(at(180, 0), "now add a boss on wave 5 with more health"),
         ]);
         assert!(matches!(r.turns[1].why, Why::Break { .. }));
-        // Not the 3 hours, and not the full 10-minute cap either: a re-read plus typing.
-        assert!(r.human_secs() <= BREAK_BACK + 60, "got {}", r.human_secs());
+        // Not the 3 hours: 2 min to catch up plus typing.
+        assert!(r.turns[1].human_secs <= BREAK_BACK + 60, "got {}", r.turns[1].human_secs);
+    }
+
+    #[test]
+    fn the_gap_curve_has_no_cliff() {
+        // More gap never earns less, nothing jumps, and it levels off.
+        let mut last = 0;
+        for g in 0..=7200 {
+            let c = gap_credit(g, FULL_AGENT);
+            assert!(c >= last, "{g}s earned less than {}s", g - 1);
+            assert!(c - last <= 1, "jump at {g}s");
+            last = c;
+        }
+        assert!(last <= FULL_AGENT + FADE);
+        assert_eq!(gap_credit(45, FULL_AGENT), 45, "the first minute counts in full");
+        assert_eq!(gap_credit(240, FULL_YOU), 240, "the first 5 min count in full after your own action");
+        // A 20 minute gap after the agent stops: about 5 min.
+        assert!((280..=300).contains(&gap_credit(1200, FULL_AGENT)), "got {}", gap_credit(1200, FULL_AGENT));
     }
 
     #[test]

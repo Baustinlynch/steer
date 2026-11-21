@@ -17,10 +17,15 @@ import { Worker, isMainThread, parentPort } from "node:worker_threads";
 import {
   applyCaps,
   buildReport,
+  checks,
   fmtDur,
+  hoursOf,
   projectAgent,
+  projectBetween,
   projectHuman,
   renderReport,
+  renderReview,
+  reviewFacts,
   rulesFrom,
 } from "../web/steer.js";
 
@@ -66,6 +71,13 @@ const JOB_SECS = 30; // a page that takes longer is given up on for a while
 // ---------- storage ----------
 
 const usersFile = join(DATA, "users.json");
+// Review pages, one file each, never changed once written.
+const REVIEWS = join(DATA, "reviews");
+const reviewFile = (id) => join(REVIEWS, `${id}.json`);
+const REVIEW_ID = /^[A-Za-z0-9_-]{12}$/;
+const REVIEW_SESSIONS = 500; // sessions a review page draws, the totals count all of them
+const GITHUB_REPO = /^https:\/\/github\.com\/[\w.-]{1,100}\/[\w.-]{1,100}$/;
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const eventsFile = (name) => join(DATA, "events", `${name}.jsonl`);
 const sha256 = (s) => createHash("sha256").update(s).digest("hex");
 
@@ -163,7 +175,10 @@ function note(store, e) {
 
 const NAME = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const clean = (s, max) => (typeof s === "string" ? s.replace(/[\u0000-\u001f]/g, "").slice(0, max) : "");
-const KINDS = new Set(["prompt", "tool", "stop", "interrupt", "checkin"]);
+const KINDS = new Set(["prompt", "tool", "stop", "interrupt", "checkin", "run", "save", "commit"]);
+// Evidence from the project, sent by steer's watcher and terminal lines: a command you ran
+// (its first word and exit code), that files were saved, a commit's hash.
+const EVIDENCE = new Set(["run", "save", "commit"]);
 // The tools steer tracks. Only Codex and Copilot write down a stopped turn; the
 // Claude Code and Cursor hooks and OpenCode never send an interrupt.
 const VIAS = new Set(["claude-code", "cursor", "codex", "opencode", "copilot", "steer"]);
@@ -189,7 +204,7 @@ function accept(raw, now) {
   const via = raw.via ?? "claude-code";
   if (!VIAS.has(via)) return null;
   if (kind === "interrupt" && !INTERRUPTS.has(via)) return null;
-  if ((kind === "checkin") !== (via === "steer")) return null;
+  if ((kind === "checkin" || EVIDENCE.has(kind)) !== (via === "steer")) return null;
   if (kind === "checkin" && !ANSWERS.has(raw.answer)) return null;
   const t = typeof raw.t === "string" && TIME.test(raw.t) ? Date.parse(raw.t) : NaN;
   if (Number.isNaN(t)) return null;
@@ -226,6 +241,23 @@ function accept(raw, now) {
     e.repeat = raw.repeat === true;
   }
   if (kind === "tool") e.tool = clean(raw.tool, 80);
+  if (kind === "run") {
+    if (typeof raw.name !== "string" || !/^[A-Za-z0-9._+-]{1,40}$/.test(raw.name)) return null;
+    if (raw.exit != null && (!Number.isInteger(raw.exit) || raw.exit < -1 || raw.exit > 255)) return null;
+    if (raw.secs != null && (!Number.isInteger(raw.secs) || raw.secs < 0 || raw.secs > 86400)) return null;
+    e.name = raw.name;
+    e.exit = raw.exit ?? null;
+    e.secs = raw.secs ?? null;
+  }
+  if (kind === "save") {
+    const n = raw.count ?? 1;
+    if (!Number.isInteger(n) || n < 1 || n > 10000) return null;
+    e.count = n;
+  }
+  if (kind === "commit") {
+    if (typeof raw.hash !== "string" || !/^[0-9a-f]{7,40}$/.test(raw.hash)) return null;
+    e.hash = raw.hash;
+  }
   if (kind === "checkin") {
     e.answer = raw.answer;
     const waited = raw.answered_after;
@@ -240,13 +272,19 @@ async function sessionsOf(name) {
   const bySession = new Map();
   await eachEvent(name, (e) => {
     if (e.late || e.kind === "checkin") return;
-    let s = bySession.get(e.session);
+    // Evidence goes in one session per project; web/steer.js merges it into the AI
+    // session it belongs to.
+    const evidence = EVIDENCE.has(e.kind);
+    const key = evidence ? `evidence:${e.project}` : e.session;
+    let s = bySession.get(key);
     if (!s) {
-      s = { path: e.session, cwd: e.project, title: null, events: [] };
-      bySession.set(e.session, s);
+      s = { path: key, cwd: e.project, title: null, events: [], evidence };
+      bySession.set(key, s);
     }
     const t = Date.parse(e.t);
-    if (e.kind === "prompt") {
+    if (evidence) {
+      s.events.push({ id: e.id, t, kind: e.kind, name: e.name, exit: e.exit, count: e.count, hash: e.hash });
+    } else if (e.kind === "prompt") {
       const prompt = {
         chars: e.chars,
         words: e.words,
@@ -322,6 +360,7 @@ const sendLimit = new Buckets(BURST, REFILL); // per account key
 const loginStarts = new Buckets(20, 1 / 30); // per IP: 20 logins, then one every 30 s
 const codeTries = new Buckets(20, 1 / 30); // per IP, typing the code from the terminal
 const signups = new Buckets(10, 1 / 360); // per IP: 10, then one every 6 minutes
+const submits = new Buckets(20, 1 / 180); // per account: 20 review pages, then one every 3 minutes
 
 // Proxies whose X-Forwarded-For is believed: this machine, plus TRUSTED_PROXIES (comma
 // separated). On Nest the proxy isn't on this machine, it connects from 10.60.1.2, so
@@ -430,8 +469,22 @@ function workerMain() {
     return r.projects;
   }
 
-  async function job({ op, name, version, project }) {
+  async function job({ op, name, version, project, from, to, info }) {
     const projects = await projectsOf(name, version);
+    if (op === "review") {
+      const whole = projects.find((x) => x.name === project);
+      if (!whole) return null;
+      const p = projectBetween(whole, from, to);
+      if (!p.sessions.length) return { empty: true };
+      const days = new Set(p.sessions.flatMap((s) => s.turns.map((t) => new Date(t.t).toISOString().slice(0, 10))));
+      const found = checks(projects, RULES).filter((c) => days.has(c.day));
+      const f = reviewFacts(p);
+      let html = renderReview({ ...p, sessions: p.sessions.slice(0, REVIEW_SESSIONS) }, info, found, RULES, f);
+      if (p.sessions.length > REVIEW_SESSIONS) {
+        html = html.replace("<h2>Sessions</h2>\n", `<h2>Sessions</h2>\n<p class="muted">Showing the newest ${REVIEW_SESSIONS} of ${p.sessions.length} sessions. The hours above count all of them.</p>\n`);
+      }
+      return { html, secs: f.you, agent: f.agent, first: f.first, last: f.last, hours: hoursOf(f.you), line: `${hoursOf(f.you)}h tracked with steer, review: ${info.url}` };
+    }
     if (op === "report") {
       return {
         profile: projects.length
@@ -667,7 +720,7 @@ async function projectPage(res, name, project) {
   if (html == null) return send(res, 404, "No such project");
   const tools = [...(store.vias.get(project) ?? [])];
   const body = `<h1><a href="/u/${encodeURIComponent(name)}">${esc(name)}</a> / ${esc(project)}</h1>
-<p class="muted">Tracked from ${esc(tools.join(", "))}.</p>
+<p class="muted">Tracked from ${esc(tools.join(", "))}. To freeze these hours into a page for a reviewer, run <code>steer submit</code> in the project's folder.</p>
 ${html}`;
   page(res, `${project} · steer`, body);
 }
@@ -683,6 +736,90 @@ async function hoursJson(res, name, project) {
     hackclub: hc ? { slack_id: hc.slack_id, verification_status: hc.verification_status, ysws_eligible: hc.ysws_eligible } : null,
     projects,
   });
+}
+
+// ---------- review pages ----------
+// `steer submit` freezes a project's hours (all of them, or between two days) into a
+// page with its own link. A reviewer opens that link instead of the live page, so the
+// hours they check can't change after the project was submitted.
+
+async function submitReview(req, res) {
+  const name = userFromKey(req);
+  if (!name) return json(res, 401, { error: "that key isn't signed in, run steer login" });
+  if (!submits.has(name)) return tooMany(res, submits.wait(name), "too many review pages at once, try again in a few minutes");
+  const body = await readJson(req, 10_000);
+  if (body === TOO_BIG) return tooLarge(req, res);
+  const project = typeof body?.project === "string" ? body.project : "";
+  if (!project || project.length > 100) return json(res, 400, { error: "say which project" });
+  const from = body.from ?? null;
+  const to = body.to ?? null;
+  for (const d of [from, to]) {
+    if (d !== null && (typeof d !== "string" || !DAY.test(d) || Number.isNaN(Date.parse(`${d}T00:00:00Z`)))) {
+      return json(res, 400, { error: "days look like 2026-11-21" });
+    }
+  }
+  if (from && to && from > to) return json(res, 400, { error: "the first day is after the last one" });
+  if (body.repo != null && (typeof body.repo !== "string" || !GITHUB_REPO.test(body.repo))) {
+    return json(res, 400, { error: "the repo should look like https://github.com/you/project" });
+  }
+  const repo = body.repo ?? null;
+  submits.take(name);
+
+  const store = await storeOf(name);
+  const id = randomBytes(9).toString("base64url");
+  const hc = users[name].hc ?? null;
+  const frozen = new Date().toISOString();
+  const url = `${PUBLIC_URL}/r/${id}`;
+  const info = { name, slack: hc?.slack_id ?? null, verified: hc?.verification_status === "verified", from, to, frozen, url, repo };
+  const r = store.counted ? await work({ op: "review", name, version: store.counted, project, from, to, info }) : null;
+  if (!r) return json(res, 404, { error: `nothing tracked in a project called ${project}` });
+  if (r.empty) return json(res, 404, { error: `nothing tracked in ${project} in those days` });
+  const review = {
+    id,
+    user: name,
+    project,
+    from,
+    to,
+    first: r.first,
+    last: r.last,
+    frozen,
+    repo,
+    slack_id: info.slack,
+    verified: info.verified,
+    secs: r.secs,
+    agent_secs: r.agent,
+    hours: r.hours,
+    url,
+    line: r.line,
+    html: r.html,
+  };
+  mkdirSync(REVIEWS, { recursive: true });
+  writeFileSync(reviewFile(id), JSON.stringify(review), { flag: "wx" });
+  json(res, 201, { id, url, hours: r.hours, your_time: fmtDur(r.secs), line: r.line });
+}
+
+function readReview(id) {
+  try {
+    return JSON.parse(readFileSync(reviewFile(id), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function reviewPage(res, id) {
+  const r = readReview(id);
+  if (!r) return send(res, 404, "No such review page");
+  const u = encodeURIComponent(r.user);
+  const body = `<h1>Review: <a href="/u/${u}">${esc(r.user)}</a> / <a href="/u/${u}/${encodeURIComponent(r.project)}">${esc(r.project)}</a></h1>
+${r.html}`;
+  page(res, `review · ${r.user} / ${r.project}`, body);
+}
+
+function reviewJson(res, id) {
+  const r = readReview(id);
+  if (!r) return json(res, 404, { error: "no such review page" });
+  const { html, ...rest } = r;
+  json(res, 200, rest);
 }
 
 // ---------- sign in with Hack Club ----------
@@ -976,6 +1113,9 @@ async function handle(req, res) {
   }
 
   if (req.method === "POST" && path === "/api/events") return postEvents(req, res);
+  if (req.method === "POST" && path === "/api/submit") return submitReview(req, res);
+  if (req.method === "GET" && (m = /^\/r\/([^/]+)$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewPage(res, m[1]);
+  if (req.method === "GET" && (m = /^\/api\/r\/([^/]+)$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewJson(res, m[1]);
 
   if (req.method === "GET" && (m = /^\/u\/([^/]+)(?:\/([^/]+))?\/?$/.exec(path))) {
     const name = decode(m[1]);
@@ -999,7 +1139,7 @@ async function handle(req, res) {
 function sweep() {
   const now = Date.now();
   sweepLogins();
-  for (const b of [sendLimit, loginStarts, codeTries, signups]) b.sweep(now);
+  for (const b of [sendLimit, loginStarts, codeTries, signups, submits]) b.sweep(now);
   for (const [name, until] of tooBig) if (until < now) tooBig.delete(name);
   for (const [name, s] of stores) if (s.store && now - s.used > STORE_IDLE) stores.delete(name);
 }

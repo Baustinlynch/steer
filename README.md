@@ -32,6 +32,7 @@ steer uninstall
 
 - claude code and cursor run `steer hook` on every prompt, tool call and when the agent finishes
 - codex, opencode and copilot dont have hooks like that, so a small background watcher (`steer watch`) reads their session logs every 5 seconds. it uses about 0.2% cpu
+- the watcher also looks at the git repos you used an ai tool in during the last 2 hours, every 30 seconds, to see when you change code or commit yourself. that counts the time you spend coding and testing by hand between prompts. a change only counts if the agent wasn't editing right then, and saving a file without changing it or undoing back to how it was doesnt count
 - events go into a queue in `~/.steer` and get sent to the server in the background, so your tools never wait on the network
 - the server stamps each event when it arrives. anything more than 5 minutes off doesnt count, so you cant make up old sessions later
 
@@ -40,6 +41,11 @@ steer uninstall
 prompt text never leaves your computer. steer reads it to work out a few counts and then drops it. this is everything a prompt event sends:
 
 `id, session, project, via (which tool), time, words, chars, images, specific, observation, generic, repeat`
+
+when you change code or commit in a repo you used ai in, the watcher sends one of these. file names and code never leave your computer:
+
+`save: id, project, time, count (how many files changed)`
+`commit: id, project, time, hash`
 
 project is the name of the git repo or folder you were in (your home folder shows up as "home"). your page is public.
 
@@ -55,9 +61,20 @@ steer doctor                       # checks everything and says how to fix what'
 steer update                       # gets the newest version now
 steer uninstall                    # takes steer out of your tools and deletes ~/.steer
 steer checkin on                   # help make the counting more accurate, see below
+steer submit                       # freeze this project's hours into a page for reviewers
 steer watch --dry-run --days 30    # what the watcher would send, as counts only
 steer report --days 30             # html report from your old claude code logs
 ```
+
+## submitting a project
+
+when you ship a project, run this in its folder:
+
+```bash
+steer submit
+```
+
+it freezes the project's hours into a review page with its own link, and prints a line to paste into the hours field when you submit. the page has the hours, a written justification, checks, every day and every session, and your commits linked on github, so a reviewer can check the hours without asking you anything. it never changes after that, even if you keep working. `--from 2026-11-01 --to 2026-11-21` limits it to those days.
 
 ## check-ins (optional, off by default)
 

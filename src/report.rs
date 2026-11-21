@@ -1,8 +1,8 @@
 //! Builds the HTML report. Prompt text never gets here.
 
 use crate::analyze::{
-    SessionReport, Turn, TurnKind, Why, DARK_FLOW_KEEP, FIRST_PROMPT_MAX, LOOP_GAP, LOW_INFO_CAP, REVIEW_CAP, TESTED_CAP,
-    TOOL_GROUPS, WATCH_WINDOW,
+    SessionReport, Turn, TurnKind, Why, BREAK_AFTER, DARK_FLOW_KEEP, FIRST_PROMPT_MAX, FULL_YOU, LOOP_GAP, LOW_INFO_CAP, TOOL_GROUPS,
+    WATCH_WINDOW,
 };
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use std::fmt::Write;
@@ -281,11 +281,6 @@ pub fn note(t: &Turn) -> (String, String) {
     let since = if t.from_agent { "after the agent stopped" } else { "after your last action" };
     let short_prompt = t.tags.contains(&"low info");
     let tested = tested_how(t);
-    let cap_why = |cap: i64| match (cap, tested) {
-        (TESTED_CAP, Some(how)) => format!(" it's {} because {how}.", exact(cap)),
-        (LOW_INFO_CAP, _) => format!(" it's {} because it's a short prompt like \"continue\".", exact(cap)),
-        _ => String::new(),
-    };
 
     let (mut short, mut long) = match (t.kind, t.why) {
         (TurnKind::Prompt, Why::First) => (
@@ -309,40 +304,7 @@ pub fn note(t: &Turn) -> (String, String) {
             format!("first action, counts {}", ago(base)),
             format!("nothing before it to measure from, so it gets a flat {}.", exact(base)),
         ),
-        (_, Why::Break { gap, cap, back }) => {
-            let came = format!("your prompt came {} {since}", exact(gap));
-            if base == t.typed + back {
-                let short = match tested {
-                    Some(_) => format!("back after a break, tested: {} + typing", ago(back)),
-                    None => format!("back after a break: {} + typing", ago(back)),
-                };
-                let long = format!(
-                    "{came}, over the {} max, so it counts as a break. we can't tell when you came back, so {} to catch up plus typing ({}) counts.{}",
-                    exact(cap),
-                    exact(back),
-                    exact(t.typed),
-                    tested.map_or(String::new(), |how| format!(
-                        " the max is {} and catch-up is {} because {how}.",
-                        exact(cap),
-                        exact(back)
-                    )),
-                );
-                (short, long)
-            } else if base > t.typed {
-                let short = if short_prompt {
-                    format!("short prompt after a break, capped at {}", ago(cap))
-                } else {
-                    format!("back after a break, capped at {}", ago(cap))
-                };
-                (short, format!("{came}, over the {} max.{}", exact(cap), cap_why(cap)))
-            } else {
-                (
-                    "typing time, longer than the max".to_string(),
-                    format!("{came}, over the {} max, but typing it takes about {}.", exact(cap), exact(t.typed)),
-                )
-            }
-        }
-        (_, Why::Reply { gap, watch, .. }) if watch > 0 => (
+        (_, Why::Gap { gap, watch, .. }) if watch > 0 => (
             format!("replied {} {since} + {} watching", ago(gap), ago(watch)),
             format!(
                 "you replied {} {since}. that's within {}, so you were probably watching it work, and {} of its run time counts too.",
@@ -351,23 +313,44 @@ pub fn note(t: &Turn) -> (String, String) {
                 exact(watch),
             ),
         ),
-        (_, Why::Reply { gap, cap, .. }) => {
-            let short = if tested.is_some() && gap > REVIEW_CAP {
-                format!("tested, replied {} {since}", ago(gap))
-            } else {
+        (_, Why::Gap { gap, full, low_info, .. }) => {
+            let short = if base >= gap {
                 format!("replied {} {since}", ago(gap))
-            };
-            let long = if t.from_agent {
-                format!("the {} between the agent stopping and your prompt counts, up to {}.", exact(gap), exact(cap))
+            } else if low_info {
+                format!("short prompt {} {since}, counts {}", ago(gap), ago(base))
+            } else if tested.is_some() {
+                format!("tested, {} {since}, counts {}", ago(gap), ago(base))
             } else {
-                format!(
-                    "the agent didn't do anything after your last action, so the {} since then counts, up to {}.",
-                    exact(gap),
-                    exact(cap)
-                )
+                format!("{} {since}, counts {}", ago(gap), ago(base))
             };
-            (short, long + &cap_why(cap))
+            let mut long = format!(
+                "you replied {} {since}. the longer a gap, the less of it counts: the first {} in full, then less and less, so {} of it counts.",
+                exact(gap),
+                exact(full),
+                exact(base)
+            );
+            if full == FULL_YOU {
+                match tested {
+                    Some(how) => long += &format!(" it's {} in full because {how}.", exact(full)),
+                    None => long += &format!(" it's {} in full because the gap started with something you did.", exact(full)),
+                }
+            }
+            if low_info {
+                long += &format!(" short prompts like \"continue\" count at most {}.", exact(LOW_INFO_CAP));
+            }
+            long += " these numbers come from a simulation matched to real logs, and will be fitted from check-in answers.";
+            (short, long)
         }
+        (_, Why::Break { gap, back }) => (
+            format!("back after a break: {} + typing", ago(back)),
+            format!(
+                "your prompt came {} {since}, over {}, so it counts as a break. we can't tell when you came back, so {} to catch up plus typing ({}) counts.",
+                exact(gap),
+                exact(BREAK_AFTER),
+                exact(back),
+                exact(t.typed),
+            ),
+        ),
         (_, Why::Typing { gap, watch }) => (
             "typing time, longer than the wait".to_string(),
             format!(
@@ -487,8 +470,9 @@ li{margin:3px 0}
 const HOW: &str = r#"<h2>How it counts</h2>
 <ul>
 <li>Your time comes from things you do: prompts, stopping the agent, rejecting a tool call, running a command.</li>
-<li>Time between the agent finishing and your next prompt counts, up to 10 min. Up to 20 min if the prompt has a screenshot, describes what happened, or you ran a command first. Up to 2 min for short prompts like "continue" (3 words or less with no file names, numbers or code).</li>
-<li>A longer gap is a break. Then only 2 min plus typing time counts (5 min if you tested something). Short prompts get 2 min at most.</li>
+<li>Time between the agent finishing and your next prompt counts, but the longer the gap, the less of it counts: the first minute in full, then less and less, up to about 5 min. If the gap started with something you did, or the prompt has a screenshot, describes what happened, or you ran a command first, the first 5 min count in full (up to about 9 min). A gap over 30 min is a break: 2 min to catch up (5 min if you tested) plus typing.</li>
+<li>Short prompts like "continue" (3 words or less with no file names, numbers or code) count at most 2 min.</li>
+<li>These numbers were picked by simulating thousands of days of work, matched to real logs, and taking the rule that came closest to the real time. They'll be fitted from check-in answers (steer checkin on).</li>
 <li>If you reply within 2 min of the agent finishing, up to 2 min of agent time counts too.</li>
 <li>Typing time is guessed from how long the prompt is, about 48 words a minute, between 5s and 5 min.</li>
 <li>A prompt never counts more than the time since your last action. The first prompt of a session, or one right after a prompt the agent never answered, only counts typing time, up to 2 min.</li>
@@ -532,7 +516,8 @@ mod tests {
             prompt(60 + 9 * 60 + 30, "make the quit button go back to the title screen"),
         ]);
         assert_eq!(n[0], "first prompt, just typing time");
-        assert_eq!(n[1], "replied 9m after the agent stopped");
+        // A 9 and a half minute gap: the first minute in full, then less and less.
+        assert_eq!(n[1], "9m after the agent stopped, counts 4m");
     }
 
     #[test]
@@ -546,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn says_why_a_break_is_short() {
+    fn says_how_much_of_a_long_gap_counts() {
         let n = notes(vec![
             prompt(0, "make the enemies spawn in waves"),
             agent(120),
@@ -554,8 +539,16 @@ mod tests {
             agent(3800),
             prompt(3800 + 3600, "now add a boss on wave 5 with more health"),
         ]);
-        assert_eq!(n[1], "short prompt after a break, capped at 2m");
+        // An hour away is a break: 2 min to catch up plus typing, not the hour.
+        assert_eq!(n[1], "back after a break: 2m + typing");
         assert_eq!(n[2], "back after a break: 2m + typing");
+        let n = notes(vec![
+            prompt(0, "make the enemies spawn in waves"),
+            agent(120),
+            prompt(120 + 20 * 60, "now add a boss on wave 5 with more health"),
+        ]);
+        // 20 minutes is still a gap, and tops out near 5 min.
+        assert_eq!(n[1], "20m after the agent stopped, counts 4m");
     }
 
     #[test]

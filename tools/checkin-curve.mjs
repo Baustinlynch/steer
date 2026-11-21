@@ -41,9 +41,13 @@ for (const file of readdirSync(dir).filter((f) => f.endsWith(".jsonl"))) {
       checkins.push({ t, answer: e.answer });
       continue;
     }
-    if (!bySession.has(e.session)) bySession.set(e.session, { path: e.session, cwd: e.project, title: null, events: [] });
-    const s = bySession.get(e.session);
-    if (e.kind === "prompt") {
+    const evidence = e.kind === "run" || e.kind === "save" || e.kind === "commit";
+    const key = evidence ? `evidence:${e.project}` : e.session;
+    if (!bySession.has(key)) bySession.set(key, { path: key, cwd: e.project, title: null, events: [], evidence });
+    const s = bySession.get(key);
+    if (evidence) {
+      s.events.push({ id: e.id, t, kind: e.kind, name: e.name, exit: e.exit, count: e.count });
+    } else if (e.kind === "prompt") {
       const { chars, words, images, specific, observation, generic, repeat } = e;
       s.events.push({ id: e.id, t, kind: "prompt", prompt: { chars, words, images, specific, observation, generic, repeat } });
     } else if (e.kind === "interrupt") {

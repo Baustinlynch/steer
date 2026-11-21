@@ -1,5 +1,6 @@
 //! `steer watch`: runs in the background and reads tools that don't have hooks
-//! (Codex, OpenCode) as they write their logs. New events are queued and sent every
+//! (Codex, OpenCode) as they write their logs, and notices saves and commits in the
+//! repos AI tools were used in (src/evidence.rs). New events are queued and sent every
 //! few seconds, same as the Claude Code hook. `steer setup` makes it start at login.
 
 use crate::live::{self, dir, enqueue, load_config};
@@ -73,6 +74,7 @@ pub fn run() -> i32 {
     // Only the installed copy updates itself, never a build someone is working on.
     let installed = std::env::current_exe().ok().and_then(|e| fs::canonicalize(e).ok()) == fs::canonicalize(live::bin_path()).ok();
     let mut checkins = crate::checkin::Schedule::new();
+    let mut evidence = crate::evidence::Watch::default();
 
     loop {
         if installed && crate::manage::update_due() {
@@ -106,6 +108,7 @@ pub fn run() -> i32 {
         }
         skip_codex = false;
         skip_copilot = false;
+        events.extend(crate::evidence::poll(&mut evidence));
 
         let _ = enqueue(&events);
         let _ = fs::write(state_path(), Value::Object(state.clone()).to_string());
@@ -257,7 +260,7 @@ pub fn autostart(remove: bool) -> Result<String, String> {
         if !out.status.success() {
             return Err(format!("launchctl said: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
-        Ok(format!("the watcher (for codex, opencode and copilot) now starts at login: {}", plist.display()))
+        Ok(format!("the watcher now starts at login: {}", plist.display()))
     } else if cfg!(target_os = "linux") {
         let unit = live::home().join(".config/systemd/user/steer-watch.service");
         if remove {
