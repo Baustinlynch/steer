@@ -72,6 +72,7 @@ pub fn run() -> i32 {
     let mut sent = HashSet::new();
     // Only the installed copy updates itself, never a build someone is working on.
     let installed = std::env::current_exe().ok().and_then(|e| fs::canonicalize(e).ok()) == fs::canonicalize(live::bin_path()).ok();
+    let mut checkins = crate::checkin::Schedule::new();
 
     loop {
         if installed && crate::manage::update_due() {
@@ -108,6 +109,7 @@ pub fn run() -> i32 {
 
         let _ = enqueue(&events);
         let _ = fs::write(state_path(), Value::Object(state.clone()).to_string());
+        crate::checkin::tick(&mut checkins);
         if !live::flushing() {
             let _ = live::flush();
         }

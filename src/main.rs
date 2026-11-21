@@ -1,4 +1,5 @@
 mod analyze;
+mod checkin;
 mod codex;
 mod copilot;
 mod claude;
@@ -97,6 +98,7 @@ fn main() {
         None => std::process::exit(manage::bare()),
         Some("hook") => return live::hook(&argv[1..]),
         Some("install") => std::process::exit(manage::finish(manage::install(&argv))),
+        Some("checkin") => std::process::exit(manage::finish(checkin::command(&argv))),
         Some("update") => std::process::exit(manage::finish(manage::update_command())),
         Some("doctor") => std::process::exit(manage::doctor()),
         Some("uninstall") => std::process::exit(manage::finish(manage::uninstall(&argv))),

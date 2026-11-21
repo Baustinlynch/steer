@@ -233,12 +233,17 @@ pub(crate) fn enqueue(events: &[Value]) -> Option<()> {
         return Some(());
     }
     fs::create_dir_all(dir()).ok()?;
+    // When an AI tool was last used, for check-ins (which don't count as use themselves).
+    if events.iter().any(|e| e["kind"] != "checkin") {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let _ = fs::write(dir().join("last-activity"), now.to_string());
+    }
     let mut queue = OpenOptions::new().create(true).append(true).open(dir().join("queue.jsonl")).ok()?;
     let lines: String = events.iter().map(|e| format!("{e}\n")).collect();
     queue.write_all(lines.as_bytes()).ok()
 }
 
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     format!("{:x}-{:x}", nanos, std::process::id())
 }
@@ -750,6 +755,8 @@ pub const HELP: &str = "live tracking:
   steer update                       get the newest version now (it also checks daily)
   steer uninstall [--yes]            take steer out of your tools and delete ~/.steer
   steer version                      show which version this is
+  steer checkin on|off               now and then, ask what you're doing, to help make
+                                     steer's counting more accurate (off by default)
 
   steer login                        sign in with your hack club account
   steer login KEY [--server URL]     use a key you already have

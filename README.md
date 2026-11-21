@@ -54,9 +54,18 @@ steer                              # sets it all up the first time, after that s
 steer doctor                       # checks everything and says how to fix what's broken
 steer update                       # gets the newest version now
 steer uninstall                    # takes steer out of your tools and deletes ~/.steer
+steer checkin on                   # help make the counting more accurate, see below
 steer watch --dry-run --days 30    # what the watcher would send, as counts only
 steer report --days 30             # html report from your old claude code logs
 ```
+
+## check-ins (optional, off by default)
+
+```bash
+steer checkin on
+```
+
+while you use an ai tool, steer asks "what are you doing right now?" once at a random moment every 20 minutes, with three buttons: something else, my project on my own, my project with the ai. if you're away it closes by itself after 90 seconds. each answer sends only which button you picked and when, and never counts as time. the answers from everyone who turns this on are used to set how steer counts the time between prompts, instead of guessing. `steer checkin off` stops it.
 
 ## updates
 
