@@ -33,6 +33,8 @@ const OBSERVATION: &[&str] = &[
 
 impl PromptInfo {
     pub fn analyze(text: &str, images: usize) -> Self {
+        let typed = typed_part(text);
+        let typed_words = typed.split_whitespace().count();
         let lower = text.to_lowercase();
         let normalized: String = lower
             .chars()
@@ -54,10 +56,11 @@ impl PromptInfo {
                 || (norm_words.len() <= 3 && specific == 0 && !observation));
 
         Self {
-            chars: text.chars().count(),
-            words: text.split_whitespace().count(),
+            chars: typed.chars().count(),
+            words: typed_words,
             images,
-            specific,
+            // A paste can name more files than the typed words, which no typed prompt can.
+            specific: specific.min(typed_words as u32 + 2),
             observation,
             generic,
             word_hashes: norm_words.iter().filter(|w| w.len() > 2).map(|w| hash(w)).collect(),
@@ -127,9 +130,37 @@ fn is_camel(w: &str) -> bool {
     cs.windows(2).any(|p| p[0].is_lowercase() && p[1].is_uppercase())
 }
 
+/// Claude Code's hook wraps pasted text in <pasted_content ...>...</pasted_content>.
+/// Pasting takes no typing, so only the rest counts for words and typing time. Same as
+/// typedPart in web/steer.js.
+pub fn typed_part(text: &str) -> String {
+    const CLOSE: &str = "</pasted_content>";
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<pasted_content") {
+        let Some(end) = rest[start..].find(CLOSE).map(|e| start + e) else { break };
+        out.push_str(&rest[..start]);
+        rest = &rest[end + CLOSE.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_text_is_not_typing() {
+        let trace = "Traceback src/main.py line 4 src/db.py line 9 ".repeat(30);
+        let p = PromptInfo::analyze(&format!("why does this crash <pasted_content id=\"1\">{trace}</pasted_content>"), 0);
+        assert_eq!(p.words, 4);
+        assert_eq!(p.chars, "why does this crash ".chars().count());
+        assert!(p.typing_secs() <= 5 + 1);
+        assert!(p.specific <= p.words as u32 + 2, "never more file names than typed words");
+        // Without the marker, everything is typing like before.
+        assert_eq!(PromptInfo::analyze("fix the jump", 0).words, 3);
+    }
 
     #[test]
     fn generic_prompts() {

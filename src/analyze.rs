@@ -236,7 +236,9 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
                             let back = if tested { BREAK_BACK_TESTED } else { BREAK_BACK };
                             ((typed + back).min(cap.max(typed)).min(wall), Why::Break { gap, cap, back })
                         } else {
-                            let watch = if gap <= WATCH_WINDOW { agent_prev.min(WATCH_WINDOW) } else { 0 };
+                            // Replying fast means you watched the agent work, but not for a
+                            // bare "ok" or "continue": that's an approval, not reading.
+                            let watch = if gap <= WATCH_WINDOW && !p.generic { agent_prev.min(WATCH_WINDOW) } else { 0 };
                             let reply = gap + watch;
                             let want = reply.max(typed);
                             let secs = want.min(wall);
@@ -410,6 +412,25 @@ mod tests {
         }
         let r = run(ev);
         assert!(r.human_secs() <= 31 + FIRST_PROMPT_MAX, "got {}", r.human_secs());
+    }
+
+    #[test]
+    fn a_bare_ok_gets_no_watching_time() {
+        let mut ev = vec![prompt(at(0, 0), "add a pause menu to the game with resume and quit buttons")];
+        for m in 1..=20 {
+            ev.push(agent(at(m, 0)));
+        }
+        ev.push(prompt(at(20, 20), "ok"));
+        let r = run(ev);
+        let ok = &r.turns[1];
+        assert!(ok.human_secs <= 25, "a bare ok 20s after the agent got {}s", ok.human_secs);
+        // A real reply that fast still counts the watching.
+        let mut ev = vec![prompt(at(0, 0), "add a pause menu to the game with resume and quit buttons")];
+        for m in 1..=20 {
+            ev.push(agent(at(m, 0)));
+        }
+        ev.push(prompt(at(20, 20), "the quit button in menu.rs closes the window instead of going back"));
+        assert!(run(ev).turns[1].human_secs >= 120);
     }
 
     #[test]

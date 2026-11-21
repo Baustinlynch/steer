@@ -4,7 +4,7 @@
 //   node tests/counting.mjs
 
 import assert from "node:assert/strict";
-import { applyCaps, buildReport, checks, projectHuman, projectOverlap, rulesFrom } from "../web/steer.js";
+import { analyzePrompt, applyCaps, buildReport, checks, projectHuman, projectOverlap, rulesFrom } from "../web/steer.js";
 
 const T0 = Date.UTC(2026, 10, 20, 15, 0, 0);
 const sec = (s) => T0 + s * 1000;
@@ -149,5 +149,23 @@ const reportOf = (sessions) => buildReport(sessions, { days: null, now: sec(10 *
 }
 // The honest session from 7 has nothing to look at.
 assert.deepEqual(checks(reportOf([session("normal", honest())])), []);
+
+// 10. A bare "ok" right after a long agent run is an approval: no watching time.
+{
+  const events = [prompt(0, 300)];
+  for (let a = 60; a <= 1200; a += 60) events.push(agent(a));
+  events.push(prompt(1220, 2, { generic: true, specific: 0 }));
+  const okTurn = reportOf([session("ok", events)])[0].sessions[0].turns[1];
+  assert.ok(okTurn.human <= 25, `a bare ok got ${okTurn.human}s`);
+}
+
+// 11. Pasted text (marked by Claude Code's hook) isn't typing.
+{
+  const trace = "Traceback src/main.py line 4 src/db.py line 9 ".repeat(30);
+  const p = analyzePrompt(`why does this crash <pasted_content id="1">${trace}</pasted_content>`, 0);
+  assert.equal(p.words, 4);
+  assert.ok(p.specific <= p.words + 2);
+  assert.equal(analyzePrompt("fix the jump", 0).words, 3);
+}
 
 console.log("counting tests passed");

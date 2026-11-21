@@ -23,7 +23,27 @@ const KEEP = /[\p{Alphabetic}\p{N}_/.:()]/u;
 const utf8 = new TextEncoder();
 const words = (s) => s.split(/\s+/).filter(Boolean);
 
+/**
+ * Claude Code's hook wraps pasted text in <pasted_content ...>...</pasted_content>.
+ * Pasting takes no typing, so only the rest counts for words and typing time. Same as
+ * typed_part in src/prompt.rs.
+ */
+export function typedPart(text) {
+  let out = "";
+  let rest = text;
+  for (;;) {
+    const start = rest.indexOf("<pasted_content");
+    if (start < 0) break;
+    const end = rest.indexOf("</pasted_content>", start);
+    if (end < 0) break;
+    out += rest.slice(0, start);
+    rest = rest.slice(end + "</pasted_content>".length);
+  }
+  return out + rest;
+}
+
 export function analyzePrompt(text, images) {
+  const typed = typedPart(text);
   const lower = text.toLowerCase();
   let normalized = "";
   for (const c of lower) normalized += ALNUM.test(c) || c === "'" ? c : " ";
@@ -38,11 +58,13 @@ export function analyzePrompt(text, images) {
   const generic =
     images === 0 && (GENERIC.has(joined) || (normWords.length <= 3 && specific === 0 && !observation));
 
+  const typedWords = words(typed).length;
   return {
-    chars: [...text].length,
-    words: raw.length,
+    chars: [...typed].length,
+    words: typedWords,
     images,
-    specific,
+    // A paste can name more files than the typed words, which no typed prompt can.
+    specific: Math.min(specific, typedWords + 2),
     observation,
     generic,
     wordSet: new Set(normWords.filter((w) => utf8.encode(w).length > 2)),
@@ -319,7 +341,8 @@ export function analyzeSession(session) {
             human = Math.min(typed + back, Math.max(cap, typed), wall);
             why = { rule: "break", gap, cap, back };
           } else {
-            const watch = gap <= WATCH_WINDOW ? Math.min(prev.agentPrev, WATCH_WINDOW) : 0;
+            // Replying fast means you watched the agent work, but not for a bare "ok".
+            const watch = gap <= WATCH_WINDOW && !p.generic ? Math.min(prev.agentPrev, WATCH_WINDOW) : 0;
             const reply = gap + watch;
             const want = Math.max(reply, typed);
             human = Math.min(want, wall);
