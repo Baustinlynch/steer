@@ -15,15 +15,20 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { Worker, isMainThread, parentPort } from "node:worker_threads";
 import {
+  applyCaps,
   buildReport,
   fmtDur,
   projectAgent,
   projectHuman,
   renderReport,
+  rulesFrom,
 } from "../web/steer.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 8790);
+// Payable caps and check thresholds, e.g. STEER_RULES='{"dailyCapHours":16}' for an event
+// that runs longer days. Anything left out keeps its default (DEFAULT_RULES in steer.js).
+const RULES = rulesFrom(JSON.parse(process.env.STEER_RULES || "{}"));
 const DATA = process.env.STEER_DATA ?? join(here, "data");
 const WEB = process.env.STEER_WEB ?? join(here, "..", "web");
 // Events whose time is further than this from when the server got them don't count.
@@ -158,10 +163,13 @@ function note(store, e) {
 
 const NAME = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const clean = (s, max) => (typeof s === "string" ? s.replace(/[\u0000-\u001f]/g, "").slice(0, max) : "");
-const KINDS = new Set(["prompt", "tool", "stop", "interrupt"]);
+const KINDS = new Set(["prompt", "tool", "stop", "interrupt", "checkin"]);
 // The tools steer tracks. Only Codex and Copilot write down a stopped turn; the
 // Claude Code and Cursor hooks and OpenCode never send an interrupt.
-const VIAS = new Set(["claude-code", "cursor", "codex", "opencode", "copilot"]);
+const VIAS = new Set(["claude-code", "cursor", "codex", "opencode", "copilot", "steer"]);
+// Check-ins (`steer checkin on`): the person's answer to "what are you doing right now?",
+// used to fit the credit curve. They come from steer itself and never count as time.
+const ANSWERS = new Set(["project-ai", "project", "other", "none"]);
 const INTERRUPTS = new Set(["codex", "copilot"]);
 const TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 const LONGEST = 256; // strings longer than this didn't come from steer
@@ -181,6 +189,8 @@ function accept(raw, now) {
   const via = raw.via ?? "claude-code";
   if (!VIAS.has(via)) return null;
   if (kind === "interrupt" && !INTERRUPTS.has(via)) return null;
+  if ((kind === "checkin") !== (via === "steer")) return null;
+  if (kind === "checkin" && !ANSWERS.has(raw.answer)) return null;
   const t = typeof raw.t === "string" && TIME.test(raw.t) ? Date.parse(raw.t) : NaN;
   if (Number.isNaN(t)) return null;
   const id = clean(raw.id, 64);
@@ -216,6 +226,12 @@ function accept(raw, now) {
     e.repeat = raw.repeat === true;
   }
   if (kind === "tool") e.tool = clean(raw.tool, 80);
+  if (kind === "checkin") {
+    e.answer = raw.answer;
+    const waited = raw.answered_after;
+    if (waited != null && (!Number.isInteger(waited) || waited < 0 || waited > 3600)) return null;
+    e.answered_after = waited ?? null;
+  }
   return e;
 }
 
@@ -223,7 +239,7 @@ function accept(raw, now) {
 async function sessionsOf(name) {
   const bySession = new Map();
   await eachEvent(name, (e) => {
-    if (e.late) return;
+    if (e.late || e.kind === "checkin") return;
     let s = bySession.get(e.session);
     if (!s) {
       s = { path: e.session, cwd: e.project, title: null, events: [] };
@@ -403,7 +419,11 @@ function workerMain() {
 
   async function projectsOf(name, version) {
     let r = kept.get(name);
-    if (!r || r.version !== version) r = { version, projects: buildReport(await sessionsOf(name), { days: null }) };
+    if (!r || r.version !== version) {
+      const projects = buildReport(await sessionsOf(name), { days: null });
+      applyCaps(projects, RULES);
+      r = { version, projects };
+    }
     kept.delete(name);
     kept.set(name, r);
     if (kept.size > 3) kept.delete(kept.keys().next().value);
@@ -420,6 +440,7 @@ function workerMain() {
               source: "events the steer client sent while working",
               sessions: false,
               projectLink: (p) => `/u/${encodeURIComponent(name)}/${encodeURIComponent(p)}`,
+              rules: RULES,
             })
           : "",
         hours: projects.map((p) => ({
@@ -438,7 +459,7 @@ function workerMain() {
 
 /** A project's report. Only the newest sessions get drawn, the totals count all of them. */
 function projectHtml(p) {
-  const opts = { window: "all time", source: "events the steer client sent while working" };
+  const opts = { window: "all time", source: "events the steer client sent while working", rules: RULES };
   let shown = 0;
   let rows = 0;
   for (const s of p.sessions) {

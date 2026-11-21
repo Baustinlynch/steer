@@ -4,7 +4,7 @@
 //   node tests/counting.mjs
 
 import assert from "node:assert/strict";
-import { buildReport, checks, projectHuman, projectOverlap } from "../web/steer.js";
+import { applyCaps, buildReport, checks, projectHuman, projectOverlap, rulesFrom } from "../web/steer.js";
 
 const T0 = Date.UTC(2026, 10, 20, 15, 0, 0);
 const sec = (s) => T0 + s * 1000;
@@ -113,6 +113,39 @@ const reportOf = (sessions) => buildReport(sessions, { days: null, now: sec(10 *
   }
   const notes = checks(reportOf([session("bot", events)])).flatMap((d) => d.notes).join(" | ");
   assert.match(notes, /replies usually came \d+s after the agent stopped/);
+}
+// 9. Payable caps: a script running for a week keeps at most 12h a UTC day and 60h a UTC
+// week, while the checks still point out what it tried to claim.
+{
+  const events = [];
+  for (let s = 0; s < 7 * 86400; ) {
+    events.push(prompt(s, 400));
+    events.push(agent(s + 60));
+    s += 60 + 400 + Math.round(rand() * 120);
+  }
+  const report = reportOf([session("week", events)]);
+  const before = report.reduce((n, p) => n + projectHuman(p), 0);
+  applyCaps(report, rulesFrom());
+  const turns = report.flatMap((p) => p.sessions.flatMap((s) => s.turns));
+  const perDay = new Map();
+  for (const t of turns) perDay.set(new Date(t.t).toISOString().slice(0, 10), (perDay.get(new Date(t.t).toISOString().slice(0, 10)) ?? 0) + t.human);
+  for (const [day, secs] of perDay) assert.ok(secs <= 12 * 3600, `${day} kept ${secs}s`);
+  const monday = (t) => {
+    const d = new Date(t);
+    d.setUTCHours(0, 0, 0, 0);
+    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+    return d.toISOString().slice(0, 10);
+  };
+  const perWeek = new Map();
+  for (const t of turns) perWeek.set(monday(t.t), (perWeek.get(monday(t.t)) ?? 0) + t.human);
+  for (const [week, secs] of perWeek) assert.ok(secs <= 60 * 3600, `week of ${week} kept ${secs}s`);
+  const after = report.reduce((n, p) => n + projectHuman(p), 0);
+  assert.equal(after + turns.reduce((n, t) => n + t.capped, 0), before, "what's cut shows up as capped");
+  assert.match(checks(report).flatMap((d) => d.notes).join(" | "), /counted in one day/);
+  // A program running a hackathon can raise them.
+  const loose = reportOf([session("week", events)]);
+  applyCaps(loose, rulesFrom({ dailyCapHours: 24, weeklyCapHours: 168 }));
+  assert.equal(loose.reduce((n, p) => n + projectHuman(p), 0), before);
 }
 // The honest session from 7 has nothing to look at.
 assert.deepEqual(checks(reportOf([session("normal", honest())])), []);

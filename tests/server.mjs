@@ -141,6 +141,11 @@ try {
     ev({ kind: "interrupt", via: "cursor" }),
     ev({ kind: "interrupt", via: "opencode" }),
     ev({ kind: "interrupt", via: undefined }),
+    // Check-ins only come from steer, with one of the known answers.
+    ev({ kind: "checkin", via: "claude-code", answer: "project" }),
+    ev({ kind: "checkin", via: "steer", answer: "maybe" }),
+    ev({ kind: "checkin", via: "steer", answer: "other", answered_after: -1 }),
+    ev({ kind: "stop", via: "steer" }),
     ev({ t: "1" }),
     ev({ t: 1763600000000 }),
     ev({ t: undefined }),
@@ -162,6 +167,8 @@ try {
     // From the future: kept, but late, so a wrong clock shows up instead of vanishing.
     ev({ t: iso(Date.now() + 60_000) }),
     ev({ t: iso(Date.now() + 3_600_000) }),
+    // A check-in answer from steer itself.
+    ev({ kind: "checkin", via: "steer", answer: "project-ai", answered_after: 4 }),
   ];
   const mixed = await post(alice, { events: [...bad, ...good] });
   assert.equal(mixed.status, 200);

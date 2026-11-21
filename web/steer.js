@@ -368,6 +368,9 @@ export function analyzeSession(session) {
       run: 0,
       // Time another session at the same moment already counted. Set by countOverlapOnce.
       overlap: 0,
+      // Time past the daily or weekly payable cap, and which one. Set by applyCaps.
+      capped: 0,
+      cap: null,
     });
     loopy.push(isLoopy);
     typing.push(typed);
@@ -521,6 +524,74 @@ const ACTIONS = {
   rejected: "Rejected tool call",
 };
 
+// ---------- rules a server can change ----------
+
+/**
+ * Settings a server can change without a new release (the steer server reads them from
+ * STEER_RULES). Caps limit what counts toward programs. Checks are when a day gets
+ * pointed out to reviewers.
+ */
+export const DEFAULT_RULES = {
+  dailyCapHours: 12,
+  weeklyCapHours: 60,
+  check: {
+    dayHours: 12,
+    activeSpanHours: 16,
+    breakHours: 2,
+    minPrompts: 10,
+    unansweredShare: 0.25,
+    tooFastShare: 0.3,
+    minReplies: 30,
+    replySecs: 15,
+    minEvenPrompts: 30,
+    evenCv: 0.5,
+    overlapMins: 30,
+  },
+};
+
+/** DEFAULT_RULES with anything in `custom` on top. */
+export function rulesFrom(custom = {}) {
+  return { ...DEFAULT_RULES, ...custom, check: { ...DEFAULT_RULES.check, ...(custom.check ?? {}) } };
+}
+
+const utcDay = (t) => new Date(t).toISOString().slice(0, 10);
+// The Monday a UTC week starts on.
+const utcWeek = (t) => {
+  const d = new Date(t);
+  d.setUTCHours(0, 0, 0, 0);
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
+};
+
+/**
+ * Payable caps. Past dailyCapHours in a UTC day, or weeklyCapHours in a UTC week, time
+ * stops counting toward programs, so even a perfect script can't earn more than that.
+ * Goes through every turn in time order after overlap is counted and moves what's past
+ * the cap to `capped`. Only the server uses this; your own report shows your real time.
+ */
+export function applyCaps(projects, rules = DEFAULT_RULES) {
+  const day = rules.dailyCapHours * 3600;
+  const week = rules.weeklyCapHours * 3600;
+  const turns = projects.flatMap((p) => p.sessions.flatMap((s) => s.turns)).sort((a, b) => a.t - b.t);
+  const perDay = new Map();
+  const perWeek = new Map();
+  for (const t of turns) {
+    if (t.human <= 0) continue;
+    const d = utcDay(t.t);
+    const w = utcWeek(t.t);
+    const usedDay = perDay.get(d) ?? 0;
+    const usedWeek = perWeek.get(w) ?? 0;
+    const keep = Math.max(0, Math.min(t.human, day - usedDay, week - usedWeek));
+    if (keep < t.human) {
+      t.capped = t.human - keep;
+      t.cap = day - usedDay <= week - usedWeek ? "day" : "week";
+      t.human = keep;
+    }
+    perDay.set(d, usedDay + keep);
+    perWeek.set(w, usedWeek + keep);
+  }
+}
+
 // ---------- checks for reviewers ----------
 
 /**
@@ -529,12 +600,13 @@ const ACTIONS = {
  * these are how it would show. Most have honest reasons too, so they're worded as things
  * to look at. Days are UTC. Returns [{ day: "2026-11-20", notes: ["..."] }], newest first.
  */
-export function checks(projects) {
+export function checks(projects, rules = DEFAULT_RULES) {
+  const c = rules.check;
   const days = new Map();
   for (const p of projects) {
     for (const s of p.sessions) {
       for (const t of s.turns) {
-        const day = new Date(t.t).toISOString().slice(0, 10);
+        const day = utcDay(t.t);
         if (!days.has(day)) days.set(day, []);
         days.get(day).push(t);
       }
@@ -544,48 +616,49 @@ export function checks(projects) {
   for (const [day, turns] of days) {
     turns.sort((a, b) => a.t - b.t);
     const notes = [];
-    const human = turns.reduce((n, t) => n + t.human, 0);
+    // Before the payable cap, so a capped day still gets pointed out.
+    const human = turns.reduce((n, t) => n + t.human + (t.capped ?? 0), 0);
     const overlap = turns.reduce((n, t) => n + t.overlap, 0);
-    if (human > 12 * 3600) notes.push(`${fmtDur(human)} counted in one day`);
+    if (human > c.dayHours * 3600) notes.push(`${fmtDur(human)} counted in one day`);
 
     const span = (turns[turns.length - 1].t - turns[0].t) / 1000;
     let longestBreak = 0;
     for (let i = 1; i < turns.length; i++) longestBreak = Math.max(longestBreak, (turns[i].t - turns[i - 1].t) / 1000);
-    if (span > 16 * 3600 && longestBreak < 2 * 3600) {
+    if (span > c.activeSpanHours * 3600 && longestBreak < c.breakHours * 3600) {
       notes.push(`active for ${fmtDur(span)} with no break longer than ${fmtDur(Math.round(longestBreak))}`);
     }
 
     const prompts = turns.filter((t) => t.kind === "prompt");
     const answered = (t) => t.agent > 0 || t.tools.some((n) => n > 0);
     const unanswered = prompts.filter((t) => !answered(t)).length;
-    if (prompts.length >= 10 && unanswered > prompts.length / 4) {
+    if (prompts.length >= c.minPrompts && unanswered > prompts.length * c.unansweredShare) {
       notes.push(`${unanswered} of ${prompts.length} prompts got no answer from an agent`);
     }
     const tooFast = prompts.filter((t) => t.why.rule === "wall").length;
-    if (prompts.length >= 10 && tooFast > prompts.length * 0.3) {
+    if (prompts.length >= c.minPrompts && tooFast > prompts.length * c.tooFastShare) {
       notes.push(`${tooFast} of ${prompts.length} prompts came faster than they could be typed`);
     }
 
     const replies = prompts.filter((t) => t.fromAgent && (t.why.rule === "reply" || t.why.rule === "typing")).map((t) => t.why.gap);
-    if (replies.length >= 30) {
+    if (replies.length >= c.minReplies) {
       replies.sort((a, b) => a - b);
       const median = replies[Math.floor(replies.length / 2)];
-      if (median < 15) notes.push(`replies usually came ${median}s after the agent stopped`);
+      if (median < c.replySecs) notes.push(`replies usually came ${median}s after the agent stopped`);
     }
-    if (prompts.length >= 30) {
+    if (prompts.length >= c.minEvenPrompts) {
       const gaps = prompts.slice(1).map((t, i) => (t.t - prompts[i].t) / 1000);
       const mean = gaps.reduce((n, g) => n + g, 0) / gaps.length;
       const sd = Math.sqrt(gaps.reduce((n, g) => n + (g - mean) ** 2, 0) / gaps.length);
-      if (mean > 0 && sd / mean < 0.5) notes.push("prompts came at very even intervals");
+      if (mean > 0 && sd / mean < c.evenCv) notes.push("prompts came at very even intervals");
     }
-    if (overlap > 30 * 60) notes.push(`${fmtDur(overlap)} in sessions at the same time, counted once`);
+    if (overlap > c.overlapMins * 60) notes.push(`${fmtDur(overlap)} in sessions at the same time, counted once`);
     if (notes.length) out.push({ day, notes });
   }
   return out.sort((a, b) => (a.day < b.day ? 1 : -1));
 }
 
-function renderChecks(projects) {
-  const found = checks(projects);
+function renderChecks(projects, rules) {
+  const found = checks(projects, rules);
   let h = `<h2>Checks</h2>\n`;
   if (!found.length) return h + "<p>Nothing stood out.</p>\n";
   h += `<p class="muted">Things a reviewer might want to look at. Most have honest reasons, like a long hackathon day or running two agents at once.</p>\n<ul>\n`;
@@ -603,12 +676,14 @@ export function renderReport(
     sessions: showSessions = true,
     projectLink = null,
     checks: showChecks = true,
+    rules = DEFAULT_RULES,
   },
 ) {
   const human = sum(projects, projectHuman);
   const agent = sum(projects, projectAgent);
   const flagged = sum(projects, projectFlagged);
   const overlap = sum(projects, projectOverlap);
+  const capped = sum(projects, (p) => sum(p.sessions, (s) => s.turns.reduce((n, t) => n + (t.capped ?? 0), 0)));
   const sessions = sum(projects, (p) => p.sessions.length);
   let h = "";
 
@@ -620,11 +695,11 @@ export function renderReport(
 <tr><th>1/3 rule</th><td>${fmtDur(Math.trunc(agent / 3))}</td></tr>
 <tr><th>Dark flow (not counted)</th><td>${fmtDur(flagged)}</td></tr>
 <tr><th>Sessions at the same time (counted once)</th><td>${fmtDur(overlap)}</td></tr>
-</table>
+${capped > 0 ? `<tr><th>Past the ${rules.dailyCapHours}h a day or ${rules.weeklyCapHours}h a week cap (not counted)</th><td>${fmtDur(capped)}</td></tr>\n` : ""}</table>
 `;
 
   const scale = Math.max(1, ...projects.map((p) => Math.max(projectHuman(p), projectAgent(p))));
-  if (showChecks) h += renderChecks(projects);
+  if (showChecks) h += renderChecks(projects, rules);
 
   h += `<h2>Projects</h2>
 <div class="scroll"><table class="list">
@@ -668,7 +743,7 @@ function renderSession(s, hideTitles) {
     const when = dayKey(d) === startDay ? hm(d) : fullDate(d);
     const action = t.kind === "prompt" ? `Prompt (${plural(t.words, "word")})` : ACTIONS[t.kind];
     const note = turnNote(t);
-    const before = t.human + t.flagged + t.overlap;
+    const before = t.human + t.flagged + t.overlap + (t.capped ?? 0);
     const you = before !== t.human ? `${fmtDur(t.human)} (was ${fmtDur(before)})` : fmtDur(t.human);
     const did = TOOL_GROUPS.map((g, i) => [g, t.tools[i]]).filter(([, n]) => n > 0).map(([g, n]) => plural(n, g));
     h += `<tr${t.darkFlow ? ' class="flow"' : ""}><td>${when}</td><td>${action}</td><td title="${esc(note.long)}">${note.short}</td><td class="r">${you}</td><td class="r">${t.agent > 0 ? fmtDur(t.agent) : ""}</td><td>${did.join(", ")}</td></tr>\n`;
@@ -783,6 +858,10 @@ export function turnNote(t) {
     const was = t.flagged > 0 ? ` it would have been ${exact(base)}: ${short}.` : "";
     short = `<span class="red">dark flow</span>: ${shortPrompt ? "short" : "repeat"} prompt in a run of ${t.run}, typing only`;
     long = `${t.run} short or repeat prompts in a row, each within ${exact(LOOP_GAP)} of the last, and none show testing. that looks like hitting retry, so only typing time counts, up to ${exact(DARK_FLOW_KEEP)}.${was}`;
+  }
+  if (t.capped > 0) {
+    short += t.cap === "week" ? ", past the weekly cap" : ", past the daily cap";
+    long += `\n${exact(t.capped)} of this is past the ${t.cap === "week" ? "weekly" : "daily"} cap, so it doesn't count toward programs.`;
   }
   if (t.overlap > 0) {
     short += ", overlaps another session";
