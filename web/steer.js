@@ -1145,7 +1145,7 @@ const HOW = `<h2>How it counts</h2>
 <li>Your time comes from things you do: prompts, stopping the agent, rejecting a tool call, running a command.</li>
 <li>Time between the agent finishing and your next prompt counts, but the longer the gap, the less of it counts: the first minute in full, then less and less, up to about 5 min. If the gap started with something you did, or the prompt has a screenshot, describes what happened, or you ran a command first, the first 5 min count in full (up to about 9 min). A gap over 30 min is a break: 2 min to catch up (5 min if you tested) plus typing.</li>
 <li>Short prompts like "continue" (3 words or less with no file names, numbers or code) count at most 2 min.</li>
-<li>Commands you run in your project, files you save while the agent isn't editing, and your commits count as things you did, so the time around them counts like the time before a prompt.</li>
+<li>Code you change by hand while the agent isn't editing, and your commits, count as things you did, so the time around them counts like the time before a prompt.</li>
 <li>These numbers were picked by simulating thousands of days of work, matched to real logs, and taking the rule that came closest to the real time. They'll be fitted from check-in answers (steer checkin on).</li>
 <li>If you reply within 2 min of the agent finishing, up to 2 min of agent time counts too.</li>
 <li>Typing time is guessed from how long the prompt is, about 48 words a minute, between 5s and 5 min.</li>

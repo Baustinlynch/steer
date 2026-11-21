@@ -11,7 +11,8 @@
 <body>
 <main>
 <h1>steer</h1>
-<p>Shows how much of your Claude Code time was you and how much was the agent working by itself. Made for Hack Club's AI time tracking bounty.</p>
+<p>Tracks the time you spend working with AI coding agents. The time the agent runs by itself doesn't count, only what you do around it: writing prompts, reading what it did, testing and fixing things. Made for Hack Club's AI time tracking bounty.</p>
+<p>See it on real work: <a href="/u/duck">a live page</a>, which updates while duck works, and <a href="/r/a5t3Rd_gdBPo">a review page</a>, what a reviewer opens when a project gets submitted.</p>
 
 <h2>Live tracking</h2>
 <p>Install steer once and it tracks Claude Code, Codex, OpenCode, Copilot and Cursor while you work. Your page at steer.duck.hackclub.app/u/your-name updates as you go.</p>
@@ -23,6 +24,10 @@
 <div class="cmd" data-os="windows"><pre><code>irm https://steer.duck.hackclub.app/install.ps1 | iex</code></pre></div>
 </div>
 <p class="muted">Prompt text never leaves your computer, only counts like how many words it had and whether it said what happened when you tested something. The code is at <a href="https://github.com/EwoudVV/steer">github.com/EwoudVV/steer</a>. If something seems off, run <code>steer doctor</code>. To undo everything: <code>steer uninstall</code></p>
+
+<h2>Submitting a project</h2>
+<p>When you ship a project, run <code>steer submit</code> in its folder. It freezes the project's hours into a page with its own link, and prints a line to paste into the hours field when you submit. The page has the hours, a written justification, checks, every day and every session, and your commits linked on GitHub, so a reviewer can check the hours without having to ask you anything. It never changes after that, even if you keep working.</p>
+<p><a href="/r/a5t3Rd_gdBPo">Here's a real one</a>, from duck's work on steer itself.</p>
 
 <h2>Or check your old Claude Code logs</h2>
 <p>Claude Code keeps them in a hidden folder:</p>
