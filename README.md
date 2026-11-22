@@ -1,5 +1,7 @@
 # steer
 
+[![steered with ai](https://steer.duck.hackclub.app/badge/duck/ai_tracker.svg)](https://steer.duck.hackclub.app/u/duck/ai_tracker)
+
 steer tracks the time you spend working with ai coding agents. the time the agent runs by itself doesnt count, only what you do around it, like writing prompts, reading what it did, testing and fixing stuff. made for hack club's ai time tracking bounty.
 
 works with claude code, codex, opencode, copilot (vs code and cli) and cursor.
