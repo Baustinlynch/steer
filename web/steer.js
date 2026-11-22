@@ -182,8 +182,10 @@ function userEvent(v, t) {
   }
 
   const originKind = v.origin && typeof v.origin === "object" ? v.origin.kind : undefined;
-  if (typeof originKind === "string" && originKind !== "human") return null;
-  if (typeof v.turnOrigin === "string" && v.turnOrigin !== "human") return null;
+  // "sdk" is a person typing in an app built on the Claude Agent SDK, like T3 Code.
+  const fromPerson = (s) => s === "human" || s === "sdk";
+  if (typeof originKind === "string" && !fromPerson(originKind)) return null;
+  if (typeof v.turnOrigin === "string" && !fromPerson(v.turnOrigin)) return null;
   if (v.promptSource === "system") return null;
 
   const [raw, images] = extractText(content);

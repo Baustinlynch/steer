@@ -118,14 +118,16 @@ fn user_event(v: &Value, t: DateTime<Utc>) -> Option<Event> {
     }
 
     // Newer logs mark who started a turn. Anything not from the human is skipped
-    // (background task notices, messages from other agents, synthetic turns).
+    // (background task notices, messages from other agents, synthetic turns). "sdk" is
+    // a person typing in an app built on the Claude Agent SDK, like T3 Code.
+    let from_person = |s: &str| s == "human" || s == "sdk";
     if let Some(kind) = v.pointer("/origin/kind").and_then(Value::as_str) {
-        if kind != "human" {
+        if !from_person(kind) {
             return None;
         }
     }
     if let Some(origin) = v.get("turnOrigin").and_then(Value::as_str) {
-        if origin != "human" {
+        if !from_person(origin) {
             return None;
         }
     }
@@ -258,4 +260,30 @@ fn str_field(v: &Value, key: &str) -> Option<String> {
 fn timestamp(v: &Value) -> Option<DateTime<Utc>> {
     let s = v.get("timestamp").and_then(Value::as_str)?;
     DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn line(origin: &str) -> Value {
+        json!({
+            "type": "user",
+            "timestamp": "2026-11-22T20:00:00.000Z",
+            "turnOrigin": origin,
+            "origin": { "kind": origin },
+            "message": { "role": "user", "content": "add a pause menu to main.rs" }
+        })
+    }
+
+    #[test]
+    fn prompts_typed_in_sdk_apps_count() {
+        // T3 Code and other apps on the Claude Agent SDK mark turns as "sdk".
+        assert!(prompt_line(&line("human")).unwrap().2);
+        assert!(prompt_line(&line("sdk")).unwrap().2);
+        for not_typed in ["task-notification", "task_notification", "peer", "coordinator", "scheduled", "host_synthetic"] {
+            assert!(!prompt_line(&line(not_typed)).unwrap().2, "{not_typed} isn't a person typing");
+        }
+    }
 }
