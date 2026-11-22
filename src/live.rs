@@ -265,8 +265,14 @@ pub(crate) fn project_name(cwd: &str) -> String {
     if start == home() {
         return "home".into();
     }
+    let home = home();
     let mut d = Some(start);
     while let Some(p) = d {
+        // A .git in the home folder (dotfiles) or above it isn't a project: its name
+        // would be the person's username, and the watcher would look at everything.
+        if p == home || home.starts_with(p) {
+            break;
+        }
         if p.join(".git").exists() {
             let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let mut roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());

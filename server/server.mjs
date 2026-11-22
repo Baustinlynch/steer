@@ -78,6 +78,7 @@ const REVIEWS = join(DATA, "reviews");
 const reviewFile = (id) => join(REVIEWS, `${id}.json`);
 const REVIEW_ID = /^[A-Za-z0-9_-]{12}$/;
 const REVIEW_SESSIONS = 500; // sessions a review page draws, the totals count all of them
+const REVIEW_TURNS = 5_000; // rows across those sessions
 const GITHUB_REPO = /^https:\/\/github\.com\/[\w.-]{1,100}\/[\w.-]{1,100}$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 // Commits on a review page get looked up on GitHub. A token raises GitHub's limit from
@@ -377,7 +378,12 @@ const sendLimit = new Buckets(BURST, REFILL); // per account key
 const loginStarts = new Buckets(20, 1 / 30); // per IP: 20 logins, then one every 30 s
 const codeTries = new Buckets(20, 1 / 30); // per IP, typing the code from the terminal
 const signups = new Buckets(10, 1 / 360); // per IP: 10, then one every 6 minutes
-const submits = new Buckets(20, 1 / 180); // per account: 20 review pages, then one every 3 minutes
+const submits = new Buckets(5, 1 / 600); // per account: 5 review pages, then one every 10 minutes
+const exportsPerIp = new Buckets(10, 1 / 10); // per IP: 10 event downloads, then one every 10 s
+const lookupsPerIp = new Buckets(30, 1 / 2); // per IP: 30 /api/slack lookups, then one every 2 s
+const githubPerAccount = new Buckets(40, 40 / 3600); // per account: 40 GitHub lookups an hour
+const EXPORTS_AT_ONCE = 8;
+let exporting = 0;
 
 // Proxies whose X-Forwarded-For is believed: this machine, plus TRUSTED_PROXIES (comma
 // separated). On Nest the proxy isn't on this machine, it connects from 10.60.1.2, so
@@ -500,9 +506,16 @@ function workerMain() {
       const days = new Set(p.sessions.flatMap((s) => s.turns.map((t) => new Date(t.t).toISOString().slice(0, 10))));
       const found = checks(projects, RULES).filter((c) => days.has(c.day));
       const f = reviewFacts(p);
-      let html = renderReview({ ...p, sessions: p.sessions.slice(0, REVIEW_SESSIONS) }, info, found, RULES, f);
-      if (p.sessions.length > REVIEW_SESSIONS) {
-        html = html.replace("<h2>Sessions</h2>\n", `<h2>Sessions</h2>\n<p class="muted">Showing the newest ${REVIEW_SESSIONS} of ${p.sessions.length} sessions. The hours above count all of them.</p>\n`);
+      let shown = 0;
+      let rows = 0;
+      for (const s of p.sessions) {
+        if (shown > 0 && (shown >= REVIEW_SESSIONS || rows + s.turns.length > REVIEW_TURNS)) break;
+        shown++;
+        rows += s.turns.length;
+      }
+      let html = renderReview({ ...p, sessions: p.sessions.slice(0, shown) }, info, found, RULES, f);
+      if (shown < p.sessions.length) {
+        html = html.replace("<h2>Sessions</h2>\n", `<h2>Sessions</h2>\n<p class="muted">Showing the newest ${shown} of ${p.sessions.length} sessions. The hours above count all of them, and every event is in the download below.</p>\n`);
       }
       return { html, secs: f.you, agent: f.agent, first: f.first, last: f.last, hours: hoursOf(f.you), line: `${hoursOf(f.you)}h tracked with steer, review: ${info.url}` };
     }
@@ -824,7 +837,7 @@ async function submitReview(req, res) {
     }
   }
   if (from && to && from > to) return json(res, 400, { error: "the first day is after the last one" });
-  if (body.repo != null && (typeof body.repo !== "string" || !GITHUB_REPO.test(body.repo))) {
+  if (body.repo != null && (typeof body.repo !== "string" || !GITHUB_REPO.test(body.repo) || /\/\.{1,2}(\/|$)/.test(body.repo))) {
     return json(res, 400, { error: "the repo should look like https://github.com/you/project" });
   }
   const repo = body.repo ?? null;
@@ -838,7 +851,7 @@ async function submitReview(req, res) {
   const info = { name, slack: hc?.slack_id ?? null, verified: hc?.verification_status === "verified", from, to, frozen, url, repo, checks: null };
   if (repo && store.counted) {
     const commits = await work({ op: "commits", name, version: store.counted, project, from, to });
-    if (commits.length) info.checks = await checkCommits(repo, commits);
+    if (commits.length) info.checks = await checkCommits(repo, commits, name);
   }
   const r = store.counted ? await work({ op: "review", name, version: store.counted, project, from, to, info }) : null;
   if (!r) return json(res, 404, { error: `nothing tracked in a project called ${project}` });
@@ -876,12 +889,13 @@ async function submitReview(req, res) {
  * time, "missing" when GitHub doesn't have it (not pushed, or made up), "unchecked"
  * when GitHub didn't answer.
  */
-async function checkCommits(repo, commits) {
+async function checkCommits(repo, commits, account) {
   const [owner, name] = new URL(repo).pathname.slice(1).split("/");
   const headers = { accept: "application/vnd.github+json", "user-agent": "steer-review-pages", ...(GITHUB_TOKEN ? { authorization: `Bearer ${GITHUB_TOKEN}` } : {}) };
   const out = {};
   const list = commits.filter((c) => c.hash).slice(-COMMIT_CHECKS);
   const one = async (c) => {
+    if (!githubPerAccount.take(account)) return { status: "unchecked" };
     try {
       const r = await fetch(`${GITHUB_API}/repos/${owner}/${name}/commits/${c.hash}`, { headers, signal: AbortSignal.timeout(8_000) });
       if (r.status === 404 || r.status === 422) return { status: "missing" };
@@ -889,7 +903,10 @@ async function checkCommits(repo, commits) {
       const j = await r.json();
       const when = Date.parse(j?.commit?.committer?.date ?? "");
       if (Number.isNaN(when)) return { status: "unchecked" };
-      return { status: Math.abs(when - c.t) <= COMMIT_CLOSE ? "ok" : "time", date: new Date(when).toISOString() };
+      // Who made it on GitHub, so a reviewer can see it's the person and not someone
+      // else's commit in a busy repo.
+      const login = typeof j?.author?.login === "string" ? j.author.login.slice(0, 40) : null;
+      return { status: Math.abs(when - c.t) <= COMMIT_CLOSE ? "ok" : "time", date: new Date(when).toISOString(), login };
     } catch {
       return { status: "unchecked" };
     }
@@ -1025,12 +1042,24 @@ function decisionsHtml(r, decisions, who) {
   return h;
 }
 
+// Review files never change, so the last few read stay parsed.
+const reviewCache = new Map();
 function readReview(id) {
+  if (reviewCache.has(id)) {
+    const r = reviewCache.get(id);
+    reviewCache.delete(id);
+    reviewCache.set(id, r);
+    return r;
+  }
+  let r;
   try {
-    return JSON.parse(readFileSync(reviewFile(id), "utf8"));
+    r = JSON.parse(readFileSync(reviewFile(id), "utf8"));
   } catch {
     return null;
   }
+  reviewCache.set(id, r);
+  if (reviewCache.size > 50) reviewCache.delete(reviewCache.keys().next().value);
+  return r;
 }
 
 function reviewPage(req, res, id) {
@@ -1052,28 +1081,71 @@ function reviewJson(res, id) {
   json(res, 200, { ...rest, decisions, reviewed_hours: reviewedHours(r, decisions) });
 }
 
-/** Every stored event of one account as JSON lines, optionally for one project between two times. */
-async function eventsJsonl(res, name, { project = null, lo = -Infinity, hi = Infinity } = {}) {
-  res.writeHead(200, {
-    "content-type": "application/x-ndjson; charset=utf-8",
-    "x-content-type-options": "nosniff",
-    "content-disposition": `inline; filename="${name}${project ? `-${project.replace(/[^\w.-]/g, "_")}` : ""}.jsonl"`,
-  });
-  await eachEvent(name, (e) => {
-    if (project !== null && e.project !== project) return;
-    const t = Date.parse(e.t);
-    if (t < lo || t >= hi) return;
-    res.write(JSON.stringify(e) + "\n");
-  });
-  res.end();
+/**
+ * Every stored event of one account as JSON lines, optionally for one project between
+ * two times. Streams the file, waiting whenever the reader is slow, so a client that
+ * never reads can't make the server hold the whole file in memory.
+ */
+async function eventsJsonl(req, res, name, { project = null, lo = -Infinity, hi = Infinity } = {}) {
+  const ip = clientIp(req);
+  if (!exportsPerIp.take(ip)) return tooMany(res, exportsPerIp.wait(ip), "too many downloads from here, wait a bit");
+  if (exporting >= EXPORTS_AT_ONCE) return json(res, 503, { error: "busy, try again in a minute" }, { "retry-after": "60" });
+  exporting++;
+  try {
+    res.writeHead(200, {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "x-content-type-options": "nosniff",
+      "content-disposition": `inline; filename="${name}${project ? `-${project.replace(/[^\w.-]/g, "_")}` : ""}.jsonl"`,
+    });
+    const file = eventsFile(name);
+    if (!existsSync(file)) return res.end();
+    const input = createReadStream(file, { encoding: "utf8", highWaterMark: 64 * 1024 });
+    let rest = "";
+    await new Promise((done) => {
+      const finish = () => {
+        input.destroy();
+        done();
+      };
+      res.on("close", finish);
+      input.on("error", finish);
+      input.on("data", (chunk) => {
+        const lines = (rest + chunk).split("\n");
+        rest = lines.pop();
+        let out = "";
+        for (const line of lines) {
+          if (!line) continue;
+          let e;
+          try {
+            e = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (project !== null && e.project !== project) continue;
+          const t = Date.parse(e.t);
+          if (t < lo || t >= hi) continue;
+          out += line + "\n";
+        }
+        if (out && !res.write(out)) {
+          input.pause();
+          res.once("drain", () => input.resume());
+        }
+      });
+      input.on("end", () => {
+        res.end();
+        done();
+      });
+    });
+  } finally {
+    exporting--;
+  }
 }
 
-function reviewEvents(res, id) {
+function reviewEvents(req, res, id) {
   const r = readReview(id);
   if (!r) return json(res, 404, { error: "no such review page" });
   const lo = r.from ? Date.parse(`${r.from}T00:00:00Z`) : -Infinity;
   const hi = r.to ? Date.parse(`${r.to}T00:00:00Z`) + 86_400_000 : Date.parse(r.frozen);
-  return eventsJsonl(res, r.user, { project: r.project, lo, hi });
+  return eventsJsonl(req, res, r.user, { project: r.project, lo, hi });
 }
 
 /** Everything steer has for one Slack account, for fraud squad and programs. */
@@ -1193,6 +1265,9 @@ async function loginGo(req, res) {
   if (l.state) byState.delete(l.state);
   l.state = randomBytes(16).toString("base64url");
   byState.set(l.state, code);
+  // The login has to come back to this same browser. Otherwise someone could type their
+  // own code, send the Hack Club link to someone else, and get that person's account.
+  l.browser = randomBytes(18).toString("base64url");
   const q = new URLSearchParams({
     client_id: HCA.id,
     redirect_uri: `${PUBLIC_URL}/auth/callback`,
@@ -1200,7 +1275,11 @@ async function loginGo(req, res) {
     scope: HCA_SCOPES,
     state: l.state,
   });
-  res.writeHead(303, { location: `${HCA_BASE}/oauth/authorize?${q}` });
+  const secure = PUBLIC_URL.startsWith("https://") ? "; Secure" : "";
+  res.writeHead(303, {
+    location: `${HCA_BASE}/oauth/authorize?${q}`,
+    "set-cookie": `steer_login=${l.browser}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=${LOGIN_TTL / 1000}${secure}`,
+  });
   res.end();
 }
 
@@ -1247,12 +1326,22 @@ async function hcaUser(authCode) {
   }
 }
 
-async function authCallback(res, authCode, state) {
+async function authCallback(req, res, authCode, state) {
   if (reviewerStates.has(state)) return reviewerCallback(res, authCode, state);
   const code = byState.get(state);
   const l = code && logins.get(code);
   if (!l || !HCA || !authCode) {
     return page(res, "steer login", `<h1>steer</h1>\n<p>This login didn't work or expired. Run <code>steer login</code> again.</p>`);
+  }
+  const cookie = /(?:^|;\s*)steer_login=([A-Za-z0-9_-]{10,64})/.exec(req.headers.cookie ?? "")?.[1] ?? "";
+  const same = Buffer.from(cookie);
+  if (!l.browser || same.length !== Buffer.byteLength(l.browser) || !timingSafeEqual(same, Buffer.from(l.browser))) {
+    return page(
+      res,
+      "steer login",
+      `<h1>steer</h1>\n<p>This login has to finish in the browser where the code was typed. If someone sent you this link, close it, it would have signed their terminal in as you.</p>`,
+      { status: 403 },
+    );
   }
   byState.delete(state);
   l.state = null;
@@ -1393,7 +1482,7 @@ async function handle(req, res) {
     return res.end();
   }
   if (req.method === "GET" && path === "/auth/callback") {
-    return authCallback(res, url.searchParams.get("code") ?? "", url.searchParams.get("state") ?? "");
+    return authCallback(req, res, url.searchParams.get("code") ?? "", url.searchParams.get("state") ?? "");
   }
 
   if (req.method === "POST" && path === "/api/events") return postEvents(req, res);
@@ -1401,20 +1490,21 @@ async function handle(req, res) {
   if (req.method === "GET" && (m = /^\/r\/([^/]+)$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewPage(req, res, m[1]);
   if (req.method === "POST" && (m = /^\/r\/([^/]+)\/decide$/.exec(path)) && REVIEW_ID.test(m[1])) return decide(req, res, m[1]);
   if (req.method === "GET" && (m = /^\/api\/r\/([^/]+)$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewJson(res, m[1]);
-  if (req.method === "GET" && (m = /^\/api\/r\/([^/]+)\/events$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewEvents(res, m[1]);
+  if (req.method === "GET" && (m = /^\/api\/r\/([^/]+)\/events$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewEvents(req, res, m[1]);
   if (req.method === "GET" && (m = /^\/badge\/([^/]+?)(?:\/([^/]+?))?\.svg$/.exec(path))) {
     return badge(res, decode(m[1]), m[2] === undefined ? undefined : decode(m[2]));
   }
   if (req.method === "GET" && path === "/reviewer/login") return reviewerLogin(req, res, url.searchParams.get("r") ?? "");
   if (req.method === "GET" && (m = /^\/api\/slack\/([^/]+)$/.exec(path))) {
     if (!SLACK_ID.test(m[1])) return json(res, 400, { error: "slack ids look like U0123ABCD" });
+    if (!lookupsPerIp.take(clientIp(req))) return tooMany(res, lookupsPerIp.wait(clientIp(req)), "too many lookups from here, wait a bit");
     return slackLookup(res, m[1]);
   }
   if (req.method === "GET" && (m = /^\/api\/u\/([^/]+)\/events$/.exec(path))) {
     const name = decode(m[1]);
     if (name === null || !hasUser(name)) return json(res, 404, { error: "no such user" });
     const project = url.searchParams.get("project");
-    return eventsJsonl(res, name, { project: project === null ? null : project.slice(0, 100) });
+    return eventsJsonl(req, res, name, { project: project === null ? null : project.slice(0, 100) });
   }
 
   if (req.method === "GET" && (m = /^\/u\/([^/]+)(?:\/([^/]+))?\/?$/.exec(path))) {
@@ -1444,7 +1534,7 @@ function sweep() {
   }
   for (const [t, s] of sessions) if (s.until < now) sessions.delete(t);
   for (const [k, v] of reviewerStates) if (now - v.created > LOGIN_TTL) reviewerStates.delete(k);
-  for (const b of [sendLimit, loginStarts, codeTries, signups, submits]) b.sweep(now);
+  for (const b of [sendLimit, loginStarts, codeTries, signups, submits, exportsPerIp, lookupsPerIp, githubPerAccount]) b.sweep(now);
   for (const [name, until] of tooBig) if (until < now) tooBig.delete(name);
   for (const [name, s] of stores) if (s.store && now - s.used > STORE_IDLE) stores.delete(name);
 }

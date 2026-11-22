@@ -104,8 +104,10 @@ async function login(key) {
   const authorize = new URL(go.headers.get("location"));
   assert.equal(authorize.searchParams.get("client_id"), "test-client");
   assert.equal(authorize.searchParams.get("scope"), "openid profile slack_id verification_status");
+  const cookie = go.headers.get("set-cookie").split(";")[0];
+  assert.match(cookie, /^steer_login=/, "the browser that typed the code gets a cookie");
   const back = await fetch(authorize, { redirect: "manual" });
-  const done = await (await fetch(back.headers.get("location"))).text();
+  const done = await (await fetch(back.headers.get("location"), { headers: { cookie } })).text();
   assert.ok(done.includes("Signed in as"), done);
 
   const result = (await json(`/api/cli-login/${started.code}`)).body;
@@ -177,6 +179,20 @@ try {
   for (let i = 0; i < 4; i++) await typeCode(phish.code, `AAAA-000${i}`, { "x-forwarded-for": "10.6.6.6" });
   assert.equal((await json(`/api/cli-login/${phish.code}`)).status, 404, "5 wrong codes and the login is thrown away");
   assert.equal((await typeCode(phish.code, phish.user_code)).status, 400, "even the right code is too late then");
+
+  // 6b. The other way round: the phisher types their own code in their own browser and
+  // sends the Hack Club link on. Whoever opens it is signed in to Hack Club, but the
+  // callback lands in their browser, which doesn't have the cookie, so the phisher's
+  // terminal gets nothing.
+  nextUser = { sub: "ident!victim2", nickname: "victim2", slack_id: "UVICTIM2", verification_status: "verified" };
+  const lure2 = await start(null, "10.6.6.8");
+  const go2 = await typeCode(lure2.code, lure2.user_code, { "x-forwarded-for": "10.6.6.8" });
+  assert.equal(go2.status, 303);
+  const back2 = await fetch(new URL(go2.headers.get("location")), { redirect: "manual" });
+  const victimView = await fetch(back2.headers.get("location"), { headers: { "x-forwarded-for": "10.0.0.9" } });
+  assert.equal(victimView.status, 403);
+  assert.match(await victimView.text(), /has to finish in the browser where the code was typed/);
+  assert.equal((await json(`/api/cli-login/${lure2.code}`)).body.status, "pending", "the phisher's terminal got nothing");
 
   // 7. Logins per address are limited, and none of it piles up.
   let limited = 0;

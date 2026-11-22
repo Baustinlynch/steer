@@ -261,9 +261,11 @@ pub fn analyze(session: &Session, commits: &[DateTime<Utc>]) -> SessionReport {
                 (TurnKind::Prompt, p.words, secs, why)
             }
             EventKind::Interrupt => {
-                // Measured from your last action, whatever the agent did since.
+                // Measured from your last action, whatever the agent did since. Stopping
+                // an agent that wasn't doing anything counts only a moment.
                 from_agent = false;
-                let (secs, why) = clamped(prev.map(|p| p.2), 10, 5, 300);
+                let max = if prev.is_some_and(|p| !p.3) { 5 } else { 300 };
+                let (secs, why) = clamped(prev.map(|p| p.2), 10, 5, max);
                 (TurnKind::Interrupt, 0, secs, why)
             }
             EventKind::Shell => {

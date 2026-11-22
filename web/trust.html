@@ -15,7 +15,7 @@
 <h2>What steer trusts</h2>
 <ul>
 <li><b>When things happened.</b> The server stamps every event when it arrives. An event more than 5 minutes off from that doesn't count, so old logs can't be sent in later and times can't be moved around.</li>
-<li><b>That the person did something.</b> Time only comes from things a person does: a prompt, stopping the agent, a code change while the agent wasn't editing, a commit. The agent running by itself never counts.</li>
+<li><b>That the person did something.</b> Time only comes from things a person does: a prompt, stopping the agent, a code change while the agent wasn't editing, a commit. The agent running by itself never counts, and code changes and commits only count within 30 minutes of using an AI tool, since coding without one is Hackatime's job.</li>
 <li><b>Nothing about the prompt text.</b> Prompt text never leaves the person's computer, so there's nothing to fake there either. Only counts are sent, like how many words a prompt had.</li>
 </ul>
 
@@ -26,9 +26,11 @@
 <tr><td>Running several sessions or agents at once</td><td>Time that overlaps is counted once.</td></tr>
 <tr><td>Typing "continue" or "fix it" over and over without testing</td><td>Short prompts count at most 2 minutes. 3 or more in a row without testing count only the typing, at most 30 seconds each.</td></tr>
 <tr><td>Walking away and coming back hours later</td><td>Any gap over 30 minutes is a break: 2 minutes to catch up, 5 if the person tested something, plus typing.</td></tr>
-<tr><td>Leaving it running all day</td><td>At most 12 hours a day and 60 a week count, and the day gets pointed out.</td></tr>
-<tr><td>Saving a file over and over</td><td>A save only counts if the contents changed, the agent wasn't editing, and the files aren't back to how they were in the last hour.</td></tr>
-<tr><td>Making up commits</td><td>Each commit on a review page is looked up on GitHub. A commit that isn't there, or was made at a different time than steer saw, is marked in red.</td></tr>
+<tr><td>Leaving it running all day</td><td>At most 12 hours a day and 60 a week count. A day over 12 hours, any 24 hours over 14 (so midnight doesn't hide it), and more than 8 hours with no break longer than 20 minutes all get pointed out.</td></tr>
+<tr><td>Saving a file over and over</td><td>On the person's computer a save only counts if the contents changed, the agent wasn't editing, and the files aren't back to how they were in the last hour. The server can't check that, so saves and commands only count within 30 minutes of something from an AI tool, only the first minute before each one counts in full, and a day where most of the time came from them gets pointed out.</td></tr>
+<tr><td>Making up commits</td><td>Each commit on a review page is looked up on GitHub. A commit that isn't there, or was made at a different time than steer saw, is marked in red, and the page shows who made each one on GitHub, so commits from someone else's repo stand out.</td></tr>
+<tr><td>Stopping an agent that isn't doing anything, over and over</td><td>Counts 5 seconds each.</td></tr>
+<tr><td>A new session for every prompt, so each one counts as typing</td><td>More than 2 hours a day counted just from typing gets pointed out.</td></tr>
 <tr><td>A script that prompts the agent the moment it stops</td><td>Pointed out: "replies usually came 8s after the agent stopped".</td></tr>
 <tr><td>A script with a steady rhythm</td><td>Pointed out: "prompts came at very even intervals", and long days without a break.</td></tr>
 <tr><td>Prompts the agent never answered</td><td>Only typing counts, and a day with lots of them gets pointed out.</td></tr>
@@ -36,7 +38,7 @@
 <p>The pointed out ones show up under Checks on the person's page and on every review page. They aren't automatic bans, since most have honest reasons, like a long hackathon day.</p>
 
 <h2>What it doesn't catch</h2>
-<p>steer can't stop someone who writes their own program to send made-up events with their own key, if the events look like a real person working: uneven gaps, breaks, nights off. In a simulation that copied a real rhythm, a script like that got about 4 hours a day counted, and none of the checks pointed at it. The same goes for any tracker that runs on the person's computer, Hackatime included.</p>
+<p>steer can't stop someone who writes their own program to send made-up events with their own key, if the events look like a real person working: uneven gaps, breaks, nights off. We had AI agents try to fake time on 2026-11-22: the best script that copied a real rhythm with prompts got about 4 to 6 hours a day counted without any of the checks pointing at it. Every trick that got more than that now gets pointed out, or counts nothing. The same goes for any tracker that runs on the person's computer, Hackatime included.</p>
 <p>What gives it away is the project. Made-up hours don't come with code. So on a review page, look at:</p>
 <ul>
 <li>the commits, and whether GitHub has them at the times steer saw</li>

@@ -187,12 +187,53 @@ assert.deepEqual(checks(reportOf([session("normal", honest())])), []);
   // 20 gaps of 840 s each, so nothing in between: 2 h 20 min of wall time.
   assert.ok(withEvidence <= 75 + 5 * 840, "never more than the real time");
 
-  // Saves alone, 3 minutes apart for an hour, with no AI session: an hour minus the
-  // first gap's start, counted in full since each gap starts with something you did.
+  // Saves alone, 3 minutes apart for an hour, with no AI tool used nearby: that's
+  // coding without AI, Hackatime's job, so it shows up but doesn't count.
   const saves = [];
   for (let m = 0; m <= 60; m += 3) saves.push({ id: `s${m}`, t: sec(10 * 86400 - 7200 + m * 60), kind: "save" });
   const alone = total([{ path: "evidence:other", cwd: "/home/x/other", title: null, evidence: true, events: saves }]);
-  assert.ok(alone >= 3600 - 60 && alone <= 3600 + 10, `an hour of saves counted ${alone}s`);
+  assert.equal(alone, 0, `saves with no ai use nearby counted ${alone}s`);
+}
+
+// 13. Red team, 2026-11-22: tricks with evidence and interrupts.
+{
+  // One prompt, then saves every 5 minutes all day. Saves only join the AI session
+  // within 30 minutes of something from the AI tool, measured from that, not from the
+  // last save, so the chain can't keep itself going.
+  const events = [prompt(0, 300), agent(30), agent(60)];
+  const saves = [];
+  for (let m = 5; m <= 12 * 60; m += 5) saves.push({ id: `c${m}`, t: sec(m * 60), kind: "save" });
+  const got = total([session("one", events), { path: "evidence:game", cwd: "/home/x/game", title: null, evidence: true, events: saves }]);
+  assert.ok(got <= 35 * 60, `one prompt and a day of saves counted ${got}s`);
+
+  // Interrupts every 5 minutes with no agent working: a moment each, not 5 minutes.
+  const stops = [prompt(0, 300), agent(30)];
+  for (let m = 5; m <= 12 * 60; m += 5) stops.push({ id: `i${m}`, t: sec(m * 60), kind: "interrupt" });
+  const stopped = total([session("stops", stops)]);
+  assert.ok(stopped <= 20 * 60, `a day of interrupts with no agent running counted ${stopped}s`);
+
+  // A whole day that's mostly saves next to a few prompts gets pointed out.
+  const day = [];
+  const ev = [];
+  for (let h = 0; h < 10; h++) {
+    day.push(prompt(h * 3600, 300), agent(h * 3600 + 30), agent(h * 3600 + 60));
+    for (let m = 2; m < 30; m += 2) ev.push({ id: `d${h}-${m}`, t: sec(h * 3600 + m * 60), kind: "save" });
+  }
+  const report = reportOf([session("mostly", day), { path: "evidence:game", cwd: "/home/x/game", title: null, evidence: true, events: ev }]);
+  assert.match(checks(report).flatMap((d) => d.notes).join(" | "), /came from code changes and commands/);
+
+  // 15 hours straight across midnight UTC: each day alone is under 12h, but the 24
+  // hours around it are pointed out.
+  const long = [];
+  const start = Date.UTC(2026, 10, 20, 17, 0, 0);
+  for (let s = 0; s < 15 * 3600; s += 150) {
+    long.push({ id: `l${s}`, t: start + s * 1000, kind: "prompt", prompt: { words: 40, chars: 200, images: 0, specific: 2, observation: true, generic: false, repeat: false } });
+    long.push({ id: `la${s}`, t: start + (s + 30) * 1000, kind: "agent", tools: ["Edit"] });
+  }
+  const night = buildReport([session("night", long)], { days: null, now: start + 30 * 86400000 });
+  const nightNotes = checks(night).flatMap((d) => d.notes).join(" | ");
+  assert.match(nightNotes, /counted in 24 hours/);
+  assert.doesNotMatch(nightNotes, /counted in one day/, "each day alone is under 12h");
 }
 
 console.log("counting tests passed");

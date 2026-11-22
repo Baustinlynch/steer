@@ -34,7 +34,7 @@ steer uninstall
 
 - claude code and cursor run `steer hook` on every prompt, tool call and when the agent finishes
 - codex, opencode and copilot dont have hooks like that, so a small background watcher (`steer watch`) reads their session logs every 5 seconds. it uses about 0.2% cpu
-- the watcher also looks at the git repos you used an ai tool in during the last 2 hours, every 30 seconds, to see when you change code or commit yourself. that counts the time you spend coding and testing by hand between prompts. a change only counts if the agent wasn't editing right then, and saving a file without changing it or undoing back to how it was doesnt count
+- the watcher also looks at the git repos you used an ai tool in during the last hour, every 30 seconds, to see when you change code or commit yourself. that counts the time you spend coding and testing by hand between prompts, within 30 minutes of using an ai tool. a change only counts if the agent wasn't editing right then, and saving a file without changing it or undoing back to how it was doesnt count. it only lists files with git and compares them itself, so nothing in a repo's own git settings can run
 - events go into a queue in `~/.steer` and get sent to the server in the background, so your tools never wait on the network
 - the server stamps each event when it arrives. anything more than 5 minutes off doesnt count, so you cant make up old sessions later
 

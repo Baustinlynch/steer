@@ -385,9 +385,10 @@ export function analyzeSession(session, rule = RULE) {
         break;
       }
       case "interrupt":
-        // Measured from your last action, whatever the agent did since.
+        // Measured from your last action, whatever the agent did since. Stopping an
+        // agent that wasn't doing anything counts only a moment.
         fromAgent = false;
-        [human, why] = clamped(prev ? prev.wall : null, 10, 5, 300);
+        [human, why] = clamped(prev ? prev.wall : null, 10, 5, prev && !prev.fromAgent ? 5 : 300);
         break;
       case "shell":
         ranCommand = true;
@@ -407,11 +408,18 @@ export function analyzeSession(session, rule = RULE) {
       case "save":
       case "commit":
         if (e.kind === "run") ranCommand = true;
-        if (!prev) {
+        if (session.evidence) {
+          // Nothing from an AI tool within EVIDENCE_REACH: that's coding without AI,
+          // which is Hackatime's job. Shown, not counted.
+          human = 0;
+          why = { rule: "alone" };
+        } else if (!prev) {
           human = 10;
           why = { rule: "first" };
         } else {
-          const full = prev.fromAgent ? rule.fullAgent : rule.fullYou;
+          // steer can't check a save or a command the way it can a prompt, so only the
+          // first minute of the gap before one counts in full.
+          const full = rule.fullAgent;
           if (prev.gap > rule.breakAfter) {
             human = Math.min(rule.breakBack, prev.gap);
             why = { rule: "break", gap: prev.gap, back: rule.breakBack };
@@ -540,8 +548,11 @@ function projectName(cwd) {
   return parts.length ? parts[parts.length - 1] : cwd;
 }
 
-// Evidence counts as part of the AI session it happened during or right after.
-const EVIDENCE_REACH = 2 * 3600 * 1000;
+// Evidence counts as part of the AI session it happened during or right after: within
+// this long after something from the AI tool (a prompt, a tool call, a stop), not after
+// other evidence, so a stream of saves can't keep itself going.
+const EVIDENCE_REACH = 30 * 60 * 1000;
+const EVIDENCE_KINDS = new Set(["run", "save", "commit"]);
 
 /**
  * Evidence from the project (sessions marked `evidence`, one per project, from the
@@ -560,8 +571,9 @@ function mergeEvidence(sessions) {
       let best = null;
       for (const s of mine) {
         const before = s.events.filter((x) => x.kind !== "run" && x.kind !== "save" && x.kind !== "commit" && x.t <= e.t);
-        if (!before.length || e.t > s.events[s.events.length - 1].t + EVIDENCE_REACH) continue;
+        if (!before.length) continue;
         const last = before[before.length - 1].t;
+        if (e.t > last + EVIDENCE_REACH) continue;
         if (!best || last > best.last) best = { s, last };
       }
       if (best) best.s.events.push(e);
@@ -662,6 +674,12 @@ export const DEFAULT_RULES = {
     minEvenPrompts: 30,
     evenCv: 0.5,
     overlapMins: 30,
+    evidenceHours: 2,
+    evidenceShare: 0.5,
+    typingHours: 2,
+    longDayHours: 8,
+    shortBreakMins: 20,
+    rollingHours: 14,
   },
 };
 
@@ -719,14 +737,27 @@ export function applyCaps(projects, rules = DEFAULT_RULES) {
 export function checks(projects, rules = DEFAULT_RULES) {
   const c = rules.check;
   const days = new Map();
+  const all = [];
   for (const p of projects) {
     for (const s of p.sessions) {
       for (const t of s.turns) {
         const day = utcDay(t.t);
         if (!days.has(day)) days.set(day, []);
         days.get(day).push(t);
+        all.push(t);
       }
     }
+  }
+  // The most counted in any 24 hours, by the day that window ends on, so a marathon
+  // across midnight UTC shows up even though each day alone looks fine.
+  all.sort((a, b) => a.t - b.t);
+  const rollingMax = new Map();
+  let sum = 0;
+  for (let i = 0, j = 0; i < all.length; i++) {
+    sum += all[i].human + (all[i].capped ?? 0);
+    while (all[i].t - all[j].t >= 86400000) sum -= all[j].human + (all[j++].capped ?? 0);
+    const day = utcDay(all[i].t);
+    rollingMax.set(day, Math.max(rollingMax.get(day) ?? 0, sum));
   }
   const out = [];
   for (const [day, turns] of days) {
@@ -768,6 +799,23 @@ export function checks(projects, rules = DEFAULT_RULES) {
       if (mean > 0 && sd / mean < c.evenCv) notes.push("prompts came at very even intervals");
     }
     if (overlap > c.overlapMins * 60) notes.push(`${fmtDur(overlap)} in sessions at the same time, counted once`);
+
+    // Saves and commands can't be checked like prompts can, so a day that's mostly
+    // them gets pointed out.
+    const fromEvidence = turns.filter((t) => EVIDENCE_KINDS.has(t.kind)).reduce((n, t) => n + t.human + (t.capped ?? 0), 0);
+    if (fromEvidence > c.evidenceHours * 3600 && fromEvidence > human * c.evidenceShare) {
+      notes.push(`${fmtDur(fromEvidence)} of the ${fmtDur(human)} came from code changes and commands, with ${prompts.length} prompts`);
+    }
+    // Typing time is worked out from how long a prompt is, which the client reports.
+    const typingOnly = prompts.filter((t) => ["first", "noreply", "typing"].includes(t.why.rule)).reduce((n, t) => n + t.human + (t.capped ?? 0), 0);
+    if (typingOnly > c.typingHours * 3600) notes.push(`${fmtDur(typingOnly)} counted just from typing prompts`);
+    if (human > c.longDayHours * 3600 && longestBreak < c.shortBreakMins * 60) {
+      notes.push(`${fmtDur(human)} counted with no break longer than ${fmtDur(Math.round(longestBreak))}`);
+    }
+    const rolling = rollingMax.get(day);
+    if (rolling && rolling > c.rollingHours * 3600 && human <= c.dayHours * 3600) {
+      notes.push(`${fmtDur(rolling)} counted in 24 hours`);
+    }
     if (notes.length) out.push({ day, notes });
   }
   return out.sort((a, b) => (a.day < b.day ? 1 : -1));
@@ -955,6 +1003,8 @@ export function justification(name, project, f, found, checks = null) {
       const n = commitTally(checks);
       const looked = n.ok + n.time + n.missing;
       if (looked) l += ` ${n.ok} of the ${plural(looked, "commit")} looked up on GitHub ${n.ok === 1 ? "is" : "are"} there with the time steer saw${n.time ? `, ${n.time} ${n.time === 1 ? "has" : "have"} a different time` : ""}${n.missing ? `, ${n.missing} ${n.missing === 1 ? "isn't" : "aren't"} on GitHub` : ""}.`;
+      const logins = [...new Set(Object.values(checks).map((c) => c.login).filter(Boolean))];
+      if (logins.length) l += ` On GitHub they were made by ${logins.slice(0, 5).map((x) => `@${x}`).join(", ")}${logins.length > 5 ? " and others" : ""}.`;
     }
     lines.push(l);
   }
@@ -1028,9 +1078,9 @@ ${text.split("\n\n").map((l) => `<p>${esc(l)}</p>`).join("\n")}
         gh = !k
           ? '<span class="muted">not looked up</span>'
           : k.status === "ok"
-            ? "yes, same time"
+            ? `yes, same time${k.login ? ` (by @${esc(k.login)})` : ""}`
             : k.status === "time"
-              ? `<span class="red">yes, but made ${esc(shown(k.date))}</span>`
+              ? `<span class="red">yes, but made ${esc(shown(k.date))}${k.login ? ` (by @${esc(k.login)})` : ""}</span>`
               : k.status === "missing"
                 ? '<span class="red">not found</span>'
                 : '<span class="muted">GitHub didn\'t answer</span>';
@@ -1205,6 +1255,9 @@ export function turnNote(t) {
     }
     if (w.lowInfo) long += ` short prompts like "continue" count at most ${exact(LOW_INFO_CAP)}.`;
     long += " these numbers come from a simulation matched to real logs, and will be fitted from check-in answers.";
+  } else if (w.rule === "alone") {
+    short = "no ai tool used near this, not counted";
+    long = `nothing from an ai tool within ${exact(EVIDENCE_REACH / 1000)} of this, so it's coding without ai, which steer leaves to hackatime.`;
   } else if (w.rule === "evidence") {
     const what = { run: "you ran a command in the project", save: "you saved files in the project", commit: "you committed" }[t.kind];
     short = base >= w.gap ? `${ago(w.gap)} ${since}` : `${ago(w.gap)} ${since}, counts ${ago(base)}`;
@@ -1253,7 +1306,7 @@ const HOW = `<h2>How it counts</h2>
 <li>Your time comes from things you do: prompts, stopping the agent, rejecting a tool call, running a command.</li>
 <li>Time between the agent finishing and your next prompt counts, but the longer the gap, the less of it counts: the first minute in full, then less and less, up to about 5 min. If the gap started with something you did, or the prompt has a screenshot, describes what happened, or you ran a command first, the first 5 min count in full (up to about 9 min). A gap over 30 min is a break: 2 min to catch up (5 min if you tested) plus typing.</li>
 <li>Short prompts like "continue" (3 words or less with no file names, numbers or code) count at most 2 min.</li>
-<li>Code you change by hand while the agent isn't editing, and your commits, count as things you did, so the time around them counts like the time before a prompt.</li>
+<li>Code you change by hand while the agent isn't editing, and your commits, count as things you did: the first minute before one in full, then less and less. Only within 30 min of using an AI tool, since coding without one is Hackatime's job.</li>
 <li>These numbers were picked by simulating thousands of days of work, matched to real logs, and taking the rule that came closest to the real time. They'll be fitted from check-in answers (steer checkin on).</li>
 <li>If you reply within 2 min of the agent finishing, up to 2 min of agent time counts too.</li>
 <li>Typing time is guessed from how long the prompt is, about 48 words a minute, between 5s and 5 min.</li>

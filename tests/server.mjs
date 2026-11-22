@@ -57,7 +57,7 @@ const fakeGithub = createServer((req, res) => {
   const m = /^\/repos\/a\/b\/commits\/([0-9a-f]+)$/.exec(req.url);
   const date = m && github.get(m[1]);
   if (!date) return res.writeHead(404).end("{}");
-  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sha: m[1], commit: { committer: { date } } }));
+  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sha: m[1], author: { login: "rev-gh" }, commit: { committer: { date } } }));
 });
 await new Promise((ok) => fakeGithub.listen(PORT + 1, "127.0.0.1", ok));
 
@@ -319,7 +319,8 @@ try {
       `https://github.com/a/b/commit/${hash}`,
       "steer saw 3 commits, 1 code change made by hand",
       "1 of the 3 commits looked up on GitHub is there with the time steer saw, 1 has a different time, 1 isn't on GitHub",
-      "yes, same time",
+      "yes, same time (by @rev-gh)",
+      "On GitHub they were made by @rev-gh.",
       "yes, but made",
       "not found",
       `/api/r/`,

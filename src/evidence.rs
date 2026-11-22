@@ -7,6 +7,11 @@
 //! agent's own edits don't count. Going back to a state of the files seen in the last
 //! hour (undoing a change, or flipping a file back and forth) doesn't count either, and
 //! touching a file without changing it is nothing.
+//!
+//! The repos can be anyone's, so git runs here can't let a repo's own settings run
+//! anything: no `git status` or `git log` (fsmonitor, filters and signature checks can
+//! run programs), only `ls-files`, `rev-parse`, `cat-file` and `config`, with fsmonitor
+//! off and a time limit. Files are compared here, not by git.
 
 use crate::live::{dir, event, new_id};
 use chrono::{DateTime, Utc};
@@ -15,21 +20,30 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const EVERY: Duration = Duration::from_secs(30);
-/// Same as EVIDENCE_REACH in web/steer.js: evidence further than this from AI use
-/// wouldn't join an AI session anyway.
-const REACH: i64 = 2 * 3600;
+/// Repos an AI tool was used in this recently get looked at. web/steer.js only counts
+/// evidence within 30 minutes of AI use, this is a bit longer so nothing is missed.
+const REACH: i64 = 3600;
 /// A change this soon after the agent's last step is the agent's.
 const AGENT_QUIET: i64 = 60;
 /// A new HEAD counts as a commit only if it was made this recently, so checking out an
 /// old branch isn't one.
 const COMMIT_FRESH: i64 = 600;
 const MAX_REPOS: usize = 5;
-const MAX_FILES: usize = 200;
+/// Files looked at per repo. A repo with more (an untracked node_modules, say) only
+/// gets its first this many looked at.
+const MAX_FILES: usize = 20_000;
 const MAX_FILE_BYTES: u64 = 1_000_000;
+/// Bytes read per look across all repos. Files past it are told apart by size and time.
+const READ_BUDGET: u64 = 32_000_000;
+/// No git call may take longer than this, so a stuck one can't stop the watcher.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Files that change by themselves while something runs, not because someone edited them.
+const NOISY: [&str; 12] = [".log", ".sqlite", ".sqlite3", ".db", ".db-journal", "-wal", "-shm", ".pid", ".tmp", ".swp", ".DS_Store", ".lock"];
 /// How long a state of the files is remembered.
 const REMEMBER: i64 = 3600;
 /// Repos not used with an AI tool for this long are dropped from repos.json.
@@ -104,6 +118,8 @@ struct Repo {
     head: String,
     files: HashMap<String, u64>,
     seen: VecDeque<(u64, i64)>,
+    /// Size, modified time and hash of each file last time, so unchanged files aren't read again.
+    stat: HashMap<String, (u64, i128, u64)>,
 }
 
 #[derive(Default)]
@@ -140,13 +156,19 @@ pub fn poll(w: &mut Watch) -> Vec<Value> {
 pub(crate) fn look(w: &mut Watch, active: &[Active], now: i64) -> Vec<Value> {
     w.repos.retain(|root, _| active.iter().any(|a| &a.root == root));
     let mut out = Vec::new();
+    let mut budget = READ_BUDGET;
     for a in active {
-        let Some(files) = changed_files(&a.root) else { continue };
-        let head = git(&a.root, &["rev-parse", "HEAD"]).unwrap_or_default();
+        let mut stat = w.repos.get_mut(&a.root).map(|r| std::mem::take(&mut r.stat)).unwrap_or_default();
+        let files = snapshot(&a.root, &mut stat, &mut budget);
+        if let Some(r) = w.repos.get_mut(&a.root) {
+            r.stat = stat.clone();
+        }
+        let Some(files) = files else { continue };
+        let head = git(&a.root, &["rev-parse", "HEAD"]).map(|b| String::from_utf8_lossy(&b).trim().to_owned()).unwrap_or_default();
         let state = fingerprint(&files);
         let agent_busy = now - a.agent < AGENT_QUIET;
         let Some(r) = w.repos.get_mut(&a.root) else {
-            w.repos.insert(a.root.clone(), Repo { head, files, seen: VecDeque::from([(state, now)]) });
+            w.repos.insert(a.root.clone(), Repo { head, files, seen: VecDeque::from([(state, now)]), stat });
             continue;
         };
         if head != r.head && !head.is_empty() {
@@ -171,33 +193,52 @@ pub(crate) fn look(w: &mut Watch, active: &[Active], now: i64) -> Vec<Value> {
     out
 }
 
-/// Every file that differs from the last commit, or isn't in git yet (and isn't
-/// ignored), with a hash of what's in it now. None if git can't read the repo.
-fn changed_files(root: &Path) -> Option<HashMap<String, u64>> {
-    // --no-optional-locks: a plain `git status` can rewrite the index, which would get
-    // in the way of the person's own git commands.
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+/// Every file git knows about or would add (tracked, plus untracked ones that aren't
+/// ignored) with a hash of what's in it now. Symlinks and files that change by
+/// themselves are left out. None if git can't read the repo.
+fn snapshot(root: &Path, stat: &mut HashMap<String, (u64, i128, u64)>, budget: &mut u64) -> Option<HashMap<String, u64>> {
+    let listed = git(root, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"])?;
     let mut files = HashMap::new();
-    for entry in out.stdout.split(|b| *b == 0) {
-        if entry.len() < 4 || files.len() >= MAX_FILES {
+    let mut fresh = HashMap::new();
+    for entry in listed.split(|b| *b == 0) {
+        if entry.is_empty() {
             continue;
         }
-        let path = String::from_utf8_lossy(&entry[3..]).into_owned();
+        if files.len() >= MAX_FILES {
+            break;
+        }
+        let path = String::from_utf8_lossy(entry).into_owned();
+        if NOISY.iter().any(|end| path.ends_with(end)) || files.contains_key(&path) {
+            continue;
+        }
         let full = root.join(&path);
-        let hash = match fs::metadata(&full) {
-            Ok(m) if m.is_file() && m.len() <= MAX_FILE_BYTES => fs::read(&full).map(|b| hash_of(&b)).unwrap_or(1),
-            // Too big to read every 30 seconds: its size stands in for what's in it.
-            Ok(m) => hash_of(&m.len().to_le_bytes()),
-            Err(_) => 0, // deleted
+        let hash = match fs::symlink_metadata(&full) {
+            Ok(m) if m.file_type().is_symlink() || !m.is_file() => continue,
+            Ok(m) => {
+                let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as i128).unwrap_or(0);
+                match stat.get(&path) {
+                    Some(&(len, when, hash)) if len == m.len() && when == modified => hash,
+                    _ => {
+                        let hash = if m.len() <= MAX_FILE_BYTES && m.len() <= *budget {
+                            *budget -= m.len();
+                            fs::read(&full).map(|b| hash_of(&b)).unwrap_or(1)
+                        } else {
+                            // Too big, or read enough this time: size and time stand in.
+                            hash_of(&m.len().to_le_bytes()) ^ (modified as u64)
+                        };
+                        fresh.insert(path.clone(), (m.len(), modified, hash));
+                        hash
+                    }
+                }
+            }
+            Err(_) => 0, // tracked but deleted
         };
+        if let Some(&(len, when, h)) = stat.get(&path) {
+            fresh.entry(path.clone()).or_insert((len, when, h));
+        }
         files.insert(path, hash);
     }
+    *stat = fresh;
     Some(files)
 }
 
@@ -215,20 +256,55 @@ fn hash_of(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
-fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(root).args(args).output().ok().filter(|o| o.status.success())?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+/// Runs git in a repo with nothing the repo's settings could start (fsmonitor is the one
+/// the commands used here would run), no input and a time limit. Its output, or None if
+/// it failed or took too long.
+fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "--no-optional-locks"])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Read while waiting, or a long listing fills the pipe and git never finishes.
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
+    });
+    let until = Instant::now() + GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let out = reader.join().ok()?;
+    status.filter(|s| s.success()).map(|_| out)
 }
 
 /// True if HEAD was committed in the last 10 minutes, by the person this repo is set up
-/// for (when it says who that is).
+/// for (when it says who that is). Reads the commit itself: `git log` can be made to run
+/// a signature checker.
 fn fresh_commit(root: &Path, now: i64) -> bool {
-    let Some(info) = git(root, &["log", "-1", "--format=%ct %ae", "HEAD"]) else { return false };
-    let mut parts = info.splitn(2, ' ');
-    let when = parts.next().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0);
-    let author = parts.next().unwrap_or_default();
-    let me = git(root, &["config", "user.email"]).unwrap_or_default();
-    now - when <= COMMIT_FRESH && (me.is_empty() || me.eq_ignore_ascii_case(author))
+    let Some(commit) = git(root, &["cat-file", "commit", "HEAD"]) else { return false };
+    let text = String::from_utf8_lossy(&commit);
+    let line = |who: &str| text.lines().take_while(|l| !l.is_empty()).find_map(|l| l.strip_prefix(who).map(str::to_owned));
+    let email = |l: &str| l.split_once('<').and_then(|(_, r)| r.split_once('>')).map(|(e, _)| e.to_owned()).unwrap_or_default();
+    let when = line("committer ").and_then(|l| l.rsplit(' ').nth(1).and_then(|t| t.parse::<i64>().ok())).unwrap_or(0);
+    let author = line("author ").map(|l| email(&l)).unwrap_or_default();
+    let me = git(root, &["config", "user.email"]).map(|b| String::from_utf8_lossy(&b).trim().to_owned()).unwrap_or_default();
+    now - when <= COMMIT_FRESH && (me.is_empty() || me.eq_ignore_ascii_case(&author))
 }
 
 #[cfg(test)]
@@ -283,12 +359,65 @@ mod tests {
         run(&root, &["commit", "-qm", "boss"]);
         let e = look(&mut w, &quiet(now + 140), now + 270);
         assert_eq!(kinds(e.clone()), ["commit"]);
-        let head = git(&root, &["rev-parse", "HEAD"]).unwrap();
-        assert_eq!(e[0]["hash"], head.as_str());
+        let head = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).unwrap()).unwrap();
+        assert_eq!(e[0]["hash"], head.trim());
         // A repo that's no longer active is forgotten.
         assert!(look(&mut w, &[], now + 300).is_empty());
         assert!(w.repos.is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repos_own_settings_cant_run_anything() {
+        let root = std::env::temp_dir().join(format!("steer-evil-{}", new_id()));
+        fs::create_dir_all(&root).unwrap();
+        run(&root, &["init", "-q"]);
+        let marker = root.join("ran");
+        let script = root.join("evil.sh");
+        fs::write(&script, format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display())).unwrap();
+        run(&root, &["config", "core.fsmonitor", &script.to_string_lossy()]);
+        run(&root, &["config", "filter.x.clean", &script.to_string_lossy()]);
+        run(&root, &["config", "log.showSignature", "true"]);
+        run(&root, &["config", "gpg.program", &script.to_string_lossy()]);
+        Command::new("chmod").arg("+x").arg(&script).status().unwrap();
+        fs::write(root.join(".gitattributes"), "a.txt filter=x\n").unwrap();
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        run(&root, &["-c", "core.fsmonitor=false", "-c", "filter.x.clean=cat", "add", "a.txt", ".gitattributes"]);
+        run(&root, &["-c", "core.fsmonitor=false", "-c", "filter.x.clean=cat", "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "x"]);
+        let _ = fs::remove_file(&marker);
+
+        let mut w = Watch::default();
+        let now = Utc::now().timestamp();
+        let here = [Active { root: root.clone(), name: "evil".into(), agent: 0 }];
+        look(&mut w, &here, now);
+        fs::write(root.join("a.txt"), "two\n").unwrap();
+        run(&root, &["-c", "core.fsmonitor=false", "-c", "filter.x.clean=cat", "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qam", "y"]);
+        fs::write(root.join("a.txt"), "three\n").unwrap();
+        look(&mut w, &here, now + 30);
+        look(&mut w, &here, now + 60);
+        assert!(!marker.exists(), "something in the repo's settings ran");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn symlinks_and_noisy_files_dont_count() {
+        let root = std::env::temp_dir().join(format!("steer-links-{}", new_id()));
+        fs::create_dir_all(&root).unwrap();
+        run(&root, &["init", "-q"]);
+        let outside = std::env::temp_dir().join(format!("steer-outside-{}", new_id()));
+        fs::write(&outside, "a").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        fs::write(root.join("server.log"), "a").unwrap();
+        let mut w = Watch::default();
+        let now = Utc::now().timestamp();
+        let here = [Active { root: root.clone(), name: "links".into(), agent: 0 }];
+        assert!(look(&mut w, &here, now).is_empty());
+        fs::write(&outside, "changed").unwrap();
+        fs::write(root.join("server.log"), "more lines").unwrap();
+        assert!(look(&mut w, &here, now + 30).is_empty(), "a symlink's target or a log changing isn't a save");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&outside);
     }
 
     #[test]
