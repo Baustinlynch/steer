@@ -25,8 +25,10 @@ import {
   projectHuman,
   renderReport,
   renderReview,
+  renderWeekly,
   reviewFacts,
   rulesFrom,
+  weekly,
 } from "../web/steer.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -502,7 +504,8 @@ function workerMain() {
     if (op === "report") {
       return {
         profile: projects.length
-          ? renderReport(projects, {
+          ? renderWeekly(weekly(projects)) +
+            renderReport(projects, {
               window: "all time",
               source: "events the steer client sent while working",
               sessions: false,

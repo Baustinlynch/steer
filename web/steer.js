@@ -773,6 +773,79 @@ export function checks(projects, rules = DEFAULT_RULES) {
   return out.sort((a, b) => (a.day < b.day ? 1 : -1));
 }
 
+// ---------- the last 7 days, at the top of someone's page ----------
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** Numbers for the 7 days before `now` and the 7 days before that. */
+export function weekly(projects, now = Date.now()) {
+  const span = 7 * 86400000;
+  const blank = () => ({ you: 0, agent: 0, flagged: 0, prompts: 0, tested: 0, days: new Map(), projects: new Map() });
+  const weeks = [blank(), blank()];
+  for (const p of projects) {
+    for (const s of p.sessions) {
+      for (const t of s.turns) {
+        const ago = now - t.t;
+        if (ago < 0 || ago >= 2 * span) continue;
+        const w = weeks[ago < span ? 0 : 1];
+        w.you += t.human;
+        w.agent += t.agent;
+        w.flagged += t.flagged;
+        if (t.kind === "prompt") {
+          w.prompts++;
+          if (testedHow(t) !== null) w.tested++;
+        }
+        const day = utcDate(t.t);
+        w.days.set(day, (w.days.get(day) ?? 0) + t.human);
+        w.projects.set(p.name, (w.projects.get(p.name) ?? 0) + t.human);
+      }
+    }
+  }
+  return weeks.map((w) => {
+    const days = [...w.days].filter(([, secs]) => secs > 0);
+    const best = days.sort((a, b) => b[1] - a[1])[0] ?? null;
+    const top = [...w.projects].sort((a, b) => b[1] - a[1])[0] ?? null;
+    return {
+      you: w.you,
+      agent: w.agent,
+      flagged: w.flagged,
+      prompts: w.prompts,
+      tested: w.tested,
+      days: days.length,
+      best: best && { day: best[0], secs: best[1] },
+      top: top && top[1] > 0 ? { name: top[0], secs: top[1] } : null,
+    };
+  });
+}
+
+/** The last 7 days next to the 7 before, as an HTML fragment. */
+export function renderWeekly([now, before]) {
+  if (!now.you && !before.you) return "";
+  const day = (b) => (b ? `${WEEKDAYS[new Date(`${b.day}T12:00:00Z`).getUTCDay()]} ${niceDay(b.day).replace(/, \d+$/, "")}, ${fmtDur(b.secs)}` : "-");
+  const pctOf = (w) => (w.prompts ? share(w.tested, w.prompts) : "-");
+  let line;
+  if (!now.you) line = "Nothing in the last 7 days.";
+  else if (!before.you) line = `${fmtDur(now.you)} of your own time in the last 7 days.`;
+  else {
+    const diff = now.you - before.you;
+    const than = Math.abs(diff) < 60 ? "about the same as" : diff > 0 ? `${fmtDur(diff)} more than` : `${fmtDur(-diff)} less than`;
+    line = `${fmtDur(now.you)} of your own time in the last 7 days, ${than} the 7 days before.`;
+  }
+  return `<h2>Last 7 days</h2>
+<p>${line}</p>
+<table class="list" style="width:auto">
+<tr><th></th><th class="r">Last 7 days</th><th class="r">7 days before</th></tr>
+<tr><td>Your time</td><td class="r">${fmtDur(now.you)}</td><td class="r">${fmtDur(before.you)}</td></tr>
+<tr><td>Agent running by itself</td><td class="r">${fmtDur(now.agent)}</td><td class="r">${fmtDur(before.agent)}</td></tr>
+<tr><td>Days you worked</td><td class="r">${now.days}</td><td class="r">${before.days}</td></tr>
+<tr><td>Best day</td><td class="r">${day(now.best)}</td><td class="r">${day(before.best)}</td></tr>
+<tr><td>Most time on</td><td class="r">${now.top ? esc(now.top.name) : "-"}</td><td class="r">${before.top ? esc(before.top.name) : "-"}</td></tr>
+<tr><td>Prompts after you tested something</td><td class="r">${pctOf(now)}</td><td class="r">${pctOf(before)}</td></tr>
+<tr><td>"Continue" loops (not counted)</td><td class="r">${fmtDur(now.flagged)}</td><td class="r">${fmtDur(before.flagged)}</td></tr>
+</table>
+`;
+}
+
 function renderChecks(projects, rules) {
   const found = checks(projects, rules);
   let h = `<h2>Checks</h2>\n`;

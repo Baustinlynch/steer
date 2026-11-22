@@ -363,6 +363,9 @@ try {
       assert.match(res.headers.get("content-type"), /^image\/svg\+xml/);
       assert.match(await res.text(), want, path);
     }
+    const profile = await get("/u/rev");
+    assert.match(profile.text, /<h2>Last 7 days<\/h2>\n<p>\d+[hms][^<]* of your own time in the last 7 days\.<\/p>/, "the profile starts with the last 7 days");
+    assert.ok(profile.text.indexOf("Last 7 days") < profile.text.indexOf("<h2>Totals</h2>"));
     const projectPage = await get("/u/rev/game2");
     assert.ok(projectPage.text.includes(`[![steered with ai](${STEER}/badge/rev/game2.svg)](${STEER}/u/rev/game2)`), "the project page has the line for a README");
 
