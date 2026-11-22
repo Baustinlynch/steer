@@ -100,6 +100,22 @@ the watcher checks github for a new version once a day and swaps it in by itself
 
 the website also has a drop-a-folder version of the report that runs in your browser.
 
+## hosting cost
+
+zrl's limit is $500 a month at hackatime's size: 15,488 people a month logging 109,759 hours. `tools/load/loadtest.mjs` runs the real server and sends it events the way the client does, so this can be checked again anytime.
+
+counting every one of those hours as ai time, with 3 times as much agent time around it, at 300 events an hour (real steer users send 150 to 500), that's about 100 million events a month. the busiest hour would be about 150 events a second, or around 1,900 people at once.
+
+| | people at once | events a second | cpu | memory |
+|---|---|---|---|---|
+| tested | 800 | 65 | 6% of one core | 81 MB |
+| tested | 8,000 | 650 | 20% of one core | 122 MB |
+| tested, each with a month of history | 50 | 4 | | 115 MB |
+
+that was on a laptop, a cheap server core is maybe 2 to 3 times slower. each event takes about 190 bytes on disk, so about 19 GB a month, and it gzips about 12 times smaller.
+
+so one server with 4 cores, 8 GB of memory and a 250 GB disk is plenty. after hetzner's 2026 price increase that's somewhere around €20 to €75 a month depending on where it is, so with backups it stays under $100 a month, at least 5 times under the limit.
+
 ## running your own server
 
 ```bash

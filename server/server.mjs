@@ -143,10 +143,14 @@ async function eachEvent(name, fn) {
   }
 }
 
-// What the main thread keeps per account: ids to skip repeats, and the few numbers
-// the pages show next to the report. The events themselves stay on disk.
+// What the main thread keeps per account: ids of recent events to skip repeats, and
+// the few numbers the pages show next to the report. The events themselves stay on
+// disk. Only recent ids are kept: a repeat sent later than that arrives late and
+// doesn't count anyway, and reports skip repeated ids too. Keeping every id ever sent
+// took about 6 MB per person with a month of history (tools/load/loadtest.mjs).
 const stores = new Map(); // name -> { ready, store, used }
 const STORE_IDLE = 30 * 60 * 1000;
+const RECENT_IDS = 2 * 60 * 60 * 1000;
 
 function storeOf(name) {
   let s = stores.get(name);
@@ -161,14 +165,15 @@ function storeOf(name) {
 }
 
 async function loadStore(name) {
-  const store = { ids: new Set(), counted: 0, late: 0, last: null, vias: new Map(), day: "", today: 0 };
+  const store = { ids: new Map(), counted: 0, late: 0, last: null, vias: new Map(), day: "", today: 0 };
   await eachEvent(name, (e) => note(store, e));
   return store;
 }
 
 /** Adds one stored event to the numbers kept in memory. */
 function note(store, e) {
-  store.ids.add(e.id);
+  const got = Date.parse(e.got);
+  if (Date.now() - got < RECENT_IDS) store.ids.set(e.id, got);
   if (e.late) store.late++;
   else store.counted++;
   if (!store.last || e.got > store.last) store.last = e.got;
@@ -1434,6 +1439,9 @@ async function handle(req, res) {
 function sweep() {
   const now = Date.now();
   sweepLogins();
+  for (const { store } of stores.values()) {
+    if (store) for (const [id, got] of store.ids) if (now - got >= RECENT_IDS) store.ids.delete(id);
+  }
   for (const [t, s] of sessions) if (s.until < now) sessions.delete(t);
   for (const [k, v] of reviewerStates) if (now - v.created > LOGIN_TTL) reviewerStates.delete(k);
   for (const b of [sendLimit, loginStarts, codeTries, signups, submits]) b.sweep(now);
