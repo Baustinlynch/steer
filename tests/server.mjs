@@ -350,6 +350,22 @@ try {
     const res = await fetch(STEER + `${path}/decide`, { method: "POST", body: "action=approve" });
     assert.equal(res.status, 403);
 
+    // README badges: always an image, the person's own time.
+    for (const [path, want] of [
+      ["/badge/rev/game2.svg", /steered with ai: \d+[hms]/],
+      ["/badge/rev.svg", /steered with ai: \d+[hms]/],
+      ["/badge/rev/nope.svg", /steered with ai: not found/],
+      ["/badge/nobody.svg", /steered with ai: not found/],
+      ["/badge/%E0.svg", /steered with ai: not found/],
+    ]) {
+      const res = await fetch(STEER + path);
+      assert.equal(res.status, 200, path);
+      assert.match(res.headers.get("content-type"), /^image\/svg\+xml/);
+      assert.match(await res.text(), want, path);
+    }
+    const projectPage = await get("/u/rev/game2");
+    assert.ok(projectPage.text.includes(`[![steered with ai](${STEER}/badge/rev/game2.svg)](${STEER}/u/rev/game2)`), "the project page has the line for a README");
+
     // More work afterwards doesn't change a page that was already submitted.
     await post(key, { events: [prompt({ project: "game2", t: iso(Date.now()) })] });
     assert.equal((await get(path)).text, view.text, "frozen");

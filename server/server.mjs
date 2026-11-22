@@ -734,10 +734,52 @@ async function projectPage(res, name, project) {
   const html = report.hours.some((p) => p.name === project) ? await projectOf(name, store, project) : null;
   if (html == null) return send(res, 404, "No such project");
   const tools = [...(store.vias.get(project) ?? [])];
-  const body = `<h1><a href="/u/${encodeURIComponent(name)}">${esc(name)}</a> / ${esc(project)}</h1>
+  const u = encodeURIComponent(name);
+  const pr = encodeURIComponent(project);
+  const badgeLine = `[![steered with ai](${PUBLIC_URL}/badge/${u}/${pr}.svg)](${PUBLIC_URL}/u/${u}/${pr})`;
+  const body = `<h1><a href="/u/${u}">${esc(name)}</a> / ${esc(project)}</h1>
 <p class="muted">Tracked from ${esc(tools.join(", "))}. To freeze these hours into a page for a reviewer, run <code>steer submit</code> in the project's folder.</p>
+<p><img src="/badge/${u}/${pr}.svg" alt="steered with ai"> <span class="muted">for your README, it updates by itself:</span> <code>${esc(badgeLine)}</code></p>
 ${html}`;
   page(res, `${project} · steer`, body);
+}
+
+// ---------- README badges ----------
+// /badge/NAME.svg and /badge/NAME/PROJECT.svg: "steered with ai | 12h 30m", the
+// person's own time, for a README. Always an image, so a broken link still shows.
+
+function badgeSvg(label, value) {
+  // Roughly how wide Verdana 11px is, which is what badges usually use.
+  const width = (t) => Math.ceil([...t].reduce((w, c) => w + (c === " " ? 3.9 : /[mwMW]/.test(c) ? 9.5 : /[iljtf.:']/.test(c) ? 3.6 : 6.9), 0)) + 12;
+  const lw = width(label);
+  const vw = width(value);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${lw + vw}" height="20" role="img" aria-label="${esc(label)}: ${esc(value)}">
+<title>${esc(label)}: ${esc(value)}</title>
+<rect width="${lw}" height="20" fill="#555"/>
+<rect x="${lw}" width="${vw}" height="20" fill="#000"/>
+<g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">
+<text x="${lw / 2}" y="14">${esc(label)}</text>
+<text x="${lw + vw / 2}" y="14">${esc(value)}</text>
+</g>
+</svg>
+`;
+}
+
+async function badge(res, name, project) {
+  let value = "not found";
+  try {
+    if (name !== null && project !== null && hasUser(name)) {
+      const hours = (await reportOf(name, await storeOf(name))).hours;
+      const secs = project === undefined ? hours.reduce((n, p) => n + p.your_secs, 0) : hours.find((p) => p.name === project)?.your_secs;
+      if (secs != null) value = fmtDur(secs);
+    }
+  } catch {
+    value = "busy, try later";
+  }
+  send(res, 200, badgeSvg("steered with ai", value), "image/svg+xml; charset=utf-8", {
+    "cache-control": "max-age=300",
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+  });
 }
 
 async function hoursJson(res, name, project) {
@@ -1352,6 +1394,9 @@ async function handle(req, res) {
   if (req.method === "POST" && (m = /^\/r\/([^/]+)\/decide$/.exec(path)) && REVIEW_ID.test(m[1])) return decide(req, res, m[1]);
   if (req.method === "GET" && (m = /^\/api\/r\/([^/]+)$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewJson(res, m[1]);
   if (req.method === "GET" && (m = /^\/api\/r\/([^/]+)\/events$/.exec(path)) && REVIEW_ID.test(m[1])) return reviewEvents(res, m[1]);
+  if (req.method === "GET" && (m = /^\/badge\/([^/]+?)(?:\/([^/]+?))?\.svg$/.exec(path))) {
+    return badge(res, decode(m[1]), m[2] === undefined ? undefined : decode(m[2]));
+  }
   if (req.method === "GET" && path === "/reviewer/login") return reviewerLogin(req, res, url.searchParams.get("r") ?? "");
   if (req.method === "GET" && (m = /^\/api\/slack\/([^/]+)$/.exec(path))) {
     if (!SLACK_ID.test(m[1])) return json(res, 400, { error: "slack ids look like U0123ABCD" });

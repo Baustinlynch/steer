@@ -76,6 +76,14 @@ steer submit
 
 it freezes the project's hours into a review page with its own link, and prints a line to paste into the hours field when you submit. the page has the hours, a written justification, checks, every day and every session, and your commits linked on github, so a reviewer can check the hours without asking you anything. it never changes after that, even if you keep working. `--from 2026-11-01 --to 2026-11-21` limits it to those days.
 
+## readme badge
+
+each project's page on steer has a badge for your README that shows how long you've steered it, and updates by itself:
+
+```markdown
+[![steered with ai](https://steer.duck.hackclub.app/badge/NAME/PROJECT.svg)](https://steer.duck.hackclub.app/u/NAME/PROJECT)
+```
+
 ## check-ins (optional, off by default)
 
 ```bash
