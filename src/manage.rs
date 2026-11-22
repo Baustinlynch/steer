@@ -45,6 +45,7 @@ fn tools() -> Vec<(&'static str, bool)> {
         ("opencode", data.join("opencode").exists()),
         ("copilot", env_or("COPILOT_HOME", home.join(".copilot")).exists()),
         ("cursor", live::cursor_dir().exists()),
+        ("freebuff", crate::freebuff::root().join("projects").exists()),
     ]
 }
 
@@ -140,7 +141,7 @@ pub fn install(args: &[String]) -> Result<String, String> {
         if cursor { "claude code and cursor" } else { "claude code" }
     );
     if watch {
-        println!("  - run a small background watcher that starts at login. it reads codex, opencode and copilot logs, and notices when you change code or commit in repos you use ai in (only counts get sent, never file names or code)");
+        println!("  - run a small background watcher that starts at login. it reads codex, opencode, copilot and freebuff logs, and notices when you change code or commit in repos you use ai in (only counts get sent, never file names or code)");
     }
     if let Some(change) = &path {
         println!("  - {}", describe(change));
@@ -513,9 +514,9 @@ pub fn doctor() -> i32 {
         (false, false) => Check::Info("cursor isn't installed".into()),
     });
     checks.push(if watch::running() {
-        Check::Ok("the watcher (codex, opencode, copilot, saves and commits) is running".into())
+        Check::Ok("the watcher (codex, opencode, copilot, freebuff, saves and commits) is running".into())
     } else {
-        Check::Fix("the watcher (codex, opencode, copilot, saves and commits) isn't running, run steer setup".into())
+        Check::Fix("the watcher (codex, opencode, copilot, freebuff, saves and commits) isn't running, run steer setup".into())
     });
 
     let waiting = live::queued();

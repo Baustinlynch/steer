@@ -3,6 +3,7 @@ mod checkin;
 mod codex;
 mod copilot;
 mod evidence;
+mod freebuff;
 mod claude;
 mod git;
 mod live;

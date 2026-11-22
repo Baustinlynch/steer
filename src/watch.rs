@@ -4,7 +4,7 @@
 //! few seconds, same as the Claude Code hook. `steer setup` makes it start at login.
 
 use crate::live::{self, dir, enqueue, load_config};
-use crate::{codex, copilot, opencode};
+use crate::{codex, copilot, freebuff, opencode};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::fs;
@@ -70,6 +70,7 @@ pub fn run() -> i32 {
     // history isn't sent. Files that show up after that are read from the start.
     let mut skip_codex = !state.contains_key("codex");
     let mut skip_copilot = !state.contains_key("copilot");
+    let mut skip_freebuff = !state.contains_key("freebuff");
     let mut sent = HashSet::new();
     // Only the installed copy updates itself, never a build someone is working on.
     let installed = std::env::current_exe().ok().and_then(|e| fs::canonicalize(e).ok()) == fs::canonicalize(live::bin_path()).ok();
@@ -106,8 +107,12 @@ pub fn run() -> i32 {
         if let Some(s) = state.entry("opencode").or_insert_with(|| json!({})).as_object_mut() {
             events.extend(opencode::poll(s, &mut sent));
         }
+        if let Some(s) = state.entry("freebuff").or_insert_with(|| json!({})).as_object_mut() {
+            events.extend(freebuff::poll(s, skip_freebuff));
+        }
         skip_codex = false;
         skip_copilot = false;
+        skip_freebuff = false;
         events.extend(crate::evidence::poll(&mut evidence));
 
         let _ = enqueue(&events);
