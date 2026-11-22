@@ -518,6 +518,9 @@ pub fn doctor() -> i32 {
     } else {
         Check::Fix("the watcher (codex, opencode, copilot, freebuff, saves and commits) isn't running, run steer setup".into())
     });
+    if let Some(note) = live::clock_note() {
+        checks.push(Check::Info(note));
+    }
 
     let waiting = live::queued();
     let last = live::last_sent().map(|t| format!(" (last sent {})", live::ago(t))).unwrap_or_default();

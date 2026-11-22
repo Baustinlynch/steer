@@ -49,6 +49,8 @@ when you change code or commit in a repo you used ai in, the watcher sends one o
 `save: id, project, time, count (how many files changed)`
 `commit: id, project, time, hash`
 
+each batch of events also says what time your computer thinks it is, so if your clock is off the server can fix the times instead of dropping them.
+
 project is the name of the git repo or folder you were in (your home folder shows up as "home"). your page is public.
 
 ## how time is counted

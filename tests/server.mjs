@@ -192,7 +192,7 @@ try {
   ];
   const mixed = await post(alice, { events: [...bad, ...good] });
   assert.equal(mixed.status, 200);
-  assert.deepEqual(mixed.body, { accepted: good.length, late: 3, dropped: bad.length });
+  assert.deepEqual(mixed.body, { accepted: good.length, late: 3, dropped: bad.length, skew_secs: 0 });
   const stored = readFileSync(join(data, "events", "alice.jsonl"), "utf8").trim().split("\n").slice(500).map((l) => JSON.parse(l));
   assert.equal(stored.length, good.length, "nothing refused got stored");
   assert.equal(stored[6].id, good[6].id.slice(0, 64));
@@ -350,6 +350,23 @@ try {
     // Deciding needs a reviewer session.
     const res = await fetch(STEER + `${path}/decide`, { method: "POST", body: "action=approve" });
     assert.equal(res.status, 403);
+
+    // A computer whose clock is 10 minutes slow: with sent_at, its events still count,
+    // moved to the server's time. Without it they arrive "late" like before.
+    const slow = (secs) => iso(Date.now() - 600_000 - secs * 1000);
+    const fixed = await fetch(STEER + "/api/events", {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}` },
+      body: JSON.stringify({ sent_at: slow(0), events: [prompt({ project: "clock", t: slow(30) }), prompt({ project: "clock", t: slow(20 * 60) })] }),
+    }).then((r) => r.json());
+    assert.equal(fixed.accepted, 2);
+    assert.equal(fixed.late, 1, "the one from 20 minutes before the send is still late");
+    assert.ok(fixed.skew_secs >= 599 && fixed.skew_secs <= 602, `skew ${fixed.skew_secs}`);
+    const old = await post(key, { events: [prompt({ project: "clock", t: slow(30) })] });
+    assert.equal(old.body.late, 1, "without sent_at a slow clock's events are late");
+    const stored = (await get("/api/u/rev/events?project=clock")).text.trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(stored[0].shifted, Math.round(fixed.skew_secs));
+    assert.ok(Math.abs(Date.parse(stored[0].t) - (Date.now() - 30_000)) < 10_000, "moved to about 30 s ago");
 
     // README badges: always an image, the person's own time.
     for (const [path, want] of [

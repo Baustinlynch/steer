@@ -45,6 +45,8 @@ const LATE_SECS = 300;
 // nothing real happens in the future. They're still kept, so a person whose clock is
 // wrong can see why time is missing.
 const FUTURE_SECS = 30;
+// A computer's clock can be this far off before its events get moved (see postEvents).
+const CLOCK_SLACK = 2000;
 const PUBLIC_URL = (process.env.PUBLIC_URL ?? "https://steer.duck.hackclub.app").replace(/\/$/, "");
 // Sign in with Hack Club. Without these, the server falls back to name-only signup
 // (handy for running your own).
@@ -1399,12 +1401,24 @@ async function postEvents(req, res) {
   if (!sendLimit.take(key, cost)) return tooMany(res, sendLimit.wait(key, cost), slow);
 
   const now = Date.now();
+  // The computer's clock when it sent this batch. If it's off from the server's, every
+  // event in the batch moves by the same amount before it's checked, so a computer with
+  // a wrong clock doesn't lose its events. Old events still don't count: what's checked
+  // is how long before the send each event happened, which the shift doesn't change.
+  const sentAt = typeof body.sent_at === "string" && TIME.test(body.sent_at) ? Date.parse(body.sent_at) : NaN;
+  const skew = Number.isNaN(sentAt) ? 0 : now - sentAt;
+  const shift = Math.abs(skew) > CLOCK_SLACK ? skew : 0;
   const store = await storeOf(name);
   const fresh = [];
   const ids = new Set();
   let dropped = 0;
   for (const raw of body.events) {
-    const e = accept(raw, now);
+    const moved =
+      shift && raw && typeof raw === "object" && typeof raw.t === "string" && TIME.test(raw.t)
+        ? { ...raw, t: new Date(Date.parse(raw.t) + shift).toISOString() }
+        : raw;
+    const e = accept(moved, now);
+    if (e && shift) e.shifted = Math.round(shift / 1000);
     if (!e) dropped++;
     else if (!store.ids.has(e.id) && !ids.has(e.id)) {
       ids.add(e.id);
@@ -1423,7 +1437,7 @@ async function postEvents(req, res) {
     appendFileSync(eventsFile(name), fresh.map((e) => JSON.stringify(e) + "\n").join(""));
     for (const e of fresh) note(store, e);
   }
-  return json(res, 200, { accepted: fresh.length, late: fresh.filter((e) => e.late).length, dropped });
+  return json(res, 200, { accepted: fresh.length, late: fresh.filter((e) => e.late).length, dropped, skew_secs: Math.round(skew / 1000) });
 }
 
 async function handle(req, res) {

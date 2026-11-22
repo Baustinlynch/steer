@@ -499,7 +499,13 @@ fn send_files(config: &Config, waiting: &mut Vec<Value>) -> Result<usize, String
                 }
             }
             for chunk in ready.chunks(BATCH) {
-                post(&config.server, "/api/events", Some(&config.key), &json!({ "events": chunk }))?;
+                // With this computer's time of sending, so the server can tell if its clock
+                // is off and move the events' times to match (see clock_note).
+                let sent_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+                let answer = post(&config.server, "/api/events", Some(&config.key), &json!({ "events": chunk, "sent_at": sent_at }))?;
+                if let Some(skew) = answer.get("skew_secs").and_then(Value::as_i64) {
+                    let _ = fs::write(dir().join("clock-skew"), skew.to_string());
+                }
                 sent += chunk.len();
                 let _ = fs::write(dir().join("last-sent"), Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
             }
@@ -592,6 +598,19 @@ pub(crate) fn setup_all(remove: bool, watch: bool) -> Result<String, String> {
         msg += &format!("\n{}", crate::watch::autostart(remove)?);
     }
     Ok(msg)
+}
+
+/// How far this computer's clock is from the server's, if it's off by a minute or more.
+/// The server moves the times of events it gets from here to match, so nothing is lost,
+/// but it's worth knowing.
+pub(crate) fn clock_note() -> Option<String> {
+    let skew: i64 = fs::read_to_string(dir().join("clock-skew")).ok()?.trim().parse().ok()?;
+    if skew.abs() < 60 {
+        return None;
+    }
+    let off = crate::report::fmt_dur(skew.abs());
+    let which = if skew > 0 { "behind" } else { "ahead of" };
+    Some(format!("this computer's clock is {off} {which} the server's. steer fixes the times it sends, but other apps might get confused, so it's worth setting the clock right"))
 }
 
 /// When events last went through to the server, written by `flush`.
@@ -1040,6 +1059,9 @@ pub(crate) fn status() -> String {
     out += &format!("waiting to send: {} events", queued());
     if let Some(t) = last_sent() {
         out += &format!("\nlast sent: {}", ago(t));
+    }
+    if let Some(note) = clock_note() {
+        out += &format!("\n{note}");
     }
     out
 }
