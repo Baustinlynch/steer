@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -392,6 +392,32 @@ try {
     assert.equal((await get(path)).text, view.text, "frozen");
     assert.equal((await get("/r/short")).status, 404);
     assert.equal((await get("/r/../users.json")).status, 404);
+  }
+
+  // The accuracy page adds up everyone's check-in answers, without names.
+  {
+    const key = (await signup("checker", "10.0.0.30")).body.key;
+    const at = (mins) => iso(Date.now() - mins * 60_000);
+    const answer = (a, mins) => ({ id: `id-${n++}`, session: "checkin", project: "checkin", via: "steer", kind: "checkin", answer: a, t: at(mins) });
+    const sent = await post(key, {
+      events: [
+        prompt({ session: "c1", project: "acc", t: at(4) }),
+        ev({ session: "c1", project: "acc", t: at(3.5) }),
+        answer("project-ai", 3),
+        prompt({ session: "c1", project: "acc", t: at(2) }),
+        answer("other", 1),
+      ],
+    });
+    assert.equal(sent.body.accepted, 5);
+    const acc = await get("/accuracy");
+    assert.equal(acc.status, 200);
+    // Another account above sent a check-in too.
+    const [, answers, people] = acc.text.match(/(\d+) answers from (\d+) (?:person|people)/);
+    assert.ok(Number(answers) >= 2 && Number(people) >= 1);
+    assert.match(acc.text, /1 doing something else/);
+    assert.match(acc.text, /2 minute timeout \(Hackatime\)/);
+    assert.ok(!acc.text.includes("checker"), "no names on it");
+    assert.ok(existsSync(join(data, "checkin-accounts.json")), "the accounts with answers are remembered");
   }
 
   console.log(`server tests passed (big page ${cold.ms} ms, then ${warm.ms} ms cached)`);

@@ -4,7 +4,7 @@
 //   node tests/counting.mjs
 
 import assert from "node:assert/strict";
-import { analyzePrompt, applyCaps, buildReport, checks, gapCredit, projectHuman, projectOverlap, rulesFrom } from "../web/steer.js";
+import { accuracy, analyzePrompt, applyCaps, buildReport, checkinMoments, checks, gapCredit, projectHuman, projectOverlap, renderAccuracy, rulesFrom } from "../web/steer.js";
 
 const T0 = Date.UTC(2026, 10, 20, 15, 0, 0);
 const sec = (s) => T0 + s * 1000;
@@ -234,6 +234,46 @@ assert.deepEqual(checks(reportOf([session("normal", honest())])), []);
   const nightNotes = checks(night).flatMap((d) => d.notes).join(" | ");
   assert.match(nightNotes, /counted in 24 hours/);
   assert.doesNotMatch(nightNotes, /counted in one day/, "each day alone is under 12h");
+}
+
+// The accuracy page: each check-in answer against what each way of counting counted.
+{
+  // steer counted the 300s before sec(600). Events at 0, 60, 600 and 700s.
+  const projects = [{ sessions: [{ turns: [{ t: sec(600), human: 300 }] }] }];
+  const sessions = [{ events: [0, 60, 600, 700].map((s) => ({ t: sec(s) })) }];
+  const m = checkinMoments(projects, sessions, [
+    { t: sec(30), answer: "project-ai" }, // a 1 minute gap: both timeouts count it, steer doesn't
+    { t: sec(400), answer: "project" }, // a 9 minute gap: only the 15 minute timeout, and steer
+    { t: sec(2000), answer: "none" }, // after the last event, nothing counts it
+  ]);
+  assert.deepEqual(
+    m.map((x) => [x.on, x.steer, x.two, x.fifteen]),
+    [
+      [true, 0, 1, 1],
+      [true, 1, 0, 1],
+      [false, 0, 0, 0],
+    ],
+  );
+  assert.equal(m[0].third, 1 / 3, "a flat 1/3 is a third of the 2 minute timeout");
+  const a = accuracy([m, []]);
+  assert.equal(a.people, 1, "people without answers aren't counted");
+  assert.equal(a.answers, 3);
+  assert.equal(a.truth, 2 / 3);
+  const steer = a.ways.find((w) => w.key === "steer");
+  assert.equal(steer.share, 1 / 3);
+  assert.equal(steer.whenOn, 1 / 2);
+  assert.equal(steer.whenOff, 0);
+  assert.equal(steer.offEach, null, "nobody has 10 answers yet");
+  const html = renderAccuracy(a);
+  assert.match(html, /3 answers from 1 person/);
+  assert.match(html, /too few people/);
+  // Ten answers from one person: their own total gets compared too.
+  const ten = Array.from({ length: 10 }, (_, i) => ({ answer: i < 5 ? "project" : "other", on: i < 5, steer: i < 4 ? 1 : 0, third: 0, two: 0, fifteen: 1 }));
+  const b = accuracy([ten]);
+  assert.equal(b.judged, 1);
+  assert.equal(Math.round(b.ways.find((w) => w.key === "steer").offEach * 100), 10, "steer counted 40%, they worked 50%");
+  assert.equal(Math.round(b.ways.find((w) => w.key === "fifteen").offEach * 100), 50);
+  assert.match(renderAccuracy(accuracy([])), /No answers yet/);
 }
 
 console.log("counting tests passed");

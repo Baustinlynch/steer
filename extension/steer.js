@@ -1345,3 +1345,149 @@ ${renderReport(projects, opts)}</main>
 </html>
 `;
 }
+
+// ---------- accuracy against check-ins ----------
+
+/** The ways of counting the accuracy page compares. The timeouts only get to see the
+ * AI tool activity steer sees, not the editor, so they show what Hackatime's and
+ * WakaTime's rules would count around AI work. */
+export const COUNTING_WAYS = [
+  { key: "steer", name: "steer" },
+  { key: "third", name: "a flat 1/3" },
+  { key: "two", name: "2 minute timeout (Hackatime)" },
+  { key: "fifteen", name: "15 minute timeout (WakaTime)" },
+];
+
+/** Answers a person needs before their own total is compared with their answers. */
+export const MIN_ANSWERS_EACH = 10;
+
+/**
+ * For each check-in answer ("what are you doing right now?"), whether the person was on
+ * their project, and how much of that moment each way of counting would have counted,
+ * 0 to 1. `projects` comes from buildReport (caps applied), `sessions` is what it was
+ * given, and `checkins` is [{ t, answer }].
+ */
+export function checkinMoments(projects, sessions, checkins) {
+  // Each turn counts the time just before the person's action.
+  const counted = projects
+    .flatMap((p) => p.sessions.flatMap((s) => s.turns))
+    .filter((u) => u.human > 0)
+    .map((u) => [u.t - u.human * 1000, u.t]);
+  const times = sessions.flatMap((s) => s.events.map((e) => e.t)).sort((a, b) => a - b);
+  /** How many event times are at or before t. */
+  const upTo = (t) => {
+    let lo = 0;
+    let hi = times.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (times[mid] <= t) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  return checkins.map((c) => {
+    const i = upTo(c.t);
+    const gap = i > 0 && i < times.length ? times[i] - times[i - 1] : Infinity;
+    const two = gap <= 2 * 60_000 ? 1 : 0;
+    return {
+      answer: c.answer,
+      on: c.answer === "project" || c.answer === "project-ai",
+      steer: counted.some(([from, to]) => c.t >= from && c.t <= to) ? 1 : 0,
+      third: two / 3,
+      two,
+      fifteen: gap <= 15 * 60_000 ? 1 : 0,
+    };
+  });
+}
+
+/** Adds up checkinMoments for several people (one list each). */
+export function accuracy(people) {
+  people = people.filter((p) => p.length);
+  const all = people.flat();
+  const mean = (xs, f) => (xs.length ? xs.reduce((n, x) => n + f(x), 0) / xs.length : null);
+  const working = (m) => (m.on ? 1 : 0);
+  const on = all.filter((m) => m.on);
+  const off = all.filter((m) => !m.on);
+  const truth = mean(all, working);
+  const judged = people.filter((p) => p.length >= MIN_ANSWERS_EACH);
+  const byAnswer = {};
+  for (const m of all) byAnswer[m.answer] = (byAnswer[m.answer] ?? 0) + 1;
+  return {
+    people: people.length,
+    judged: judged.length,
+    answers: all.length,
+    byAnswer,
+    truth,
+    ways: COUNTING_WAYS.map((w) => {
+      const share = mean(all, (m) => m[w.key]);
+      return {
+        ...w,
+        share,
+        whenOn: mean(on, (m) => m[w.key]),
+        whenOff: mean(off, (m) => m[w.key]),
+        off: share === null ? null : share - truth,
+        // A way of counting can be right on average and still give some people too much
+        // and others too little. This is how far each person's own total is off.
+        offEach: judged.length ? mean(judged, (p) => Math.abs(mean(p, (m) => m[w.key]) - mean(p, working))) : null,
+      };
+    }),
+  };
+}
+
+/** The accuracy page's body. */
+export function renderAccuracy(a, { updated = null } = {}) {
+  const pct = (x) => (x === null ? "-" : `${Math.round(x * 100)}%`);
+  const points = (x, signed) => {
+    if (x === null) return "-";
+    const n = Math.round(x * 100);
+    return `${signed && n > 0 ? "+" : ""}${n} points`;
+  };
+  const kinds = [
+    ["project-ai", "on their project with the AI"],
+    ["project", "on their project on their own"],
+    ["other", "doing something else"],
+    ["none", "no answer"],
+  ]
+    .filter(([k]) => a.byAnswer[k])
+    .map(([k, label]) => `${a.byAnswer[k]} ${label}`)
+    .join(", ");
+  let html = `<h1><a href="/">steer</a> / accuracy</h1>
+<p>How close steer's numbers are to what people say they were doing. With check-ins on (<code>steer checkin on</code>), steer asks "what are you doing right now?" at random moments while someone uses an AI tool. Each answer is checked against what each way of counting would have counted at that moment. This page updates by itself as answers come in.</p>
+<p><b>${a.answers} answers from ${a.people} ${a.people === 1 ? "person" : "people"}</b>${kinds ? ` (${kinds})` : ""}.${a.people < 15 ? " That's too few people to say how well it works for everyone, so these are early numbers." : ""}</p>
+`;
+  if (!a.answers) return html + `<p>No answers yet.</p>\n` + howAccuracy();
+  html += `<h2>Results</h2>
+<p>People said they were working on their project at ${pct(a.truth)} of these moments.</p>
+<table class="list">
+<tr><th>Way of counting</th><th>Counted</th><th>When they were working</th><th>When they weren't</th><th>Total off by</th><th>Each person off by</th></tr>
+${a.ways
+  .map(
+    (w) =>
+      `<tr><td>${esc(w.name)}</td><td>${pct(w.share)}</td><td>${pct(w.whenOn)}</td><td>${pct(w.whenOff)}</td><td>${points(w.off, true)}</td><td>${points(w.offEach, false)}</td></tr>`,
+  )
+  .join("\n")}
+</table>
+<ul>
+<li><b>Counted</b>: how much of these moments it counted. The closer to ${pct(a.truth)}, the better.</li>
+<li><b>When they were working</b>: of the moments people were on their project, how much it counted. Higher is better.</li>
+<li><b>When they weren't</b>: of the moments they were doing something else or away, how much it counted. Lower is better.</li>
+<li><b>Each person off by</b>: how far each person's own total is from their own answers, on average, for the ${a.judged} ${a.judged === 1 ? "person" : "people"} with ${MIN_ANSWERS_EACH} or more answers. This is what decides whether someone gets their real hours, since a way of counting can be right on average and still give some people too much and others too little.</li>
+</ul>
+`;
+  if (updated) html += `<p class="muted">Worked out ${esc(updated)}.</p>\n`;
+  return html + howAccuracy();
+}
+
+function howAccuracy() {
+  return `<h2>How it's worked out</h2>
+<ul>
+<li>Check-ins only happen while someone used an AI tool in the last hour, so this is all about time around AI work.</li>
+<li>Working means they picked "my project, on my own" or "my project, with the ai". "Something else" and no answer count as not working. The question closes by itself after 90 seconds, which usually means they were away.</li>
+<li>steer: whether the moment falls in time steer counted, with the counting steer uses today.</li>
+<li>The timeouts count a moment if steer saw activity within that many minutes before and after it, which is how Hackatime and WakaTime count editor activity. Here they only see AI tool activity, not the editor.</li>
+<li>A flat 1/3 is a third of what the 2 minute timeout counts, like programs that cut AI hours to a third.</li>
+<li>Answers never count as time, and no names are shown. The code is <code>checkinMoments</code> and <code>accuracy</code> in <a href="https://github.com/EwoudVV/steer/blob/main/web/steer.js">web/steer.js</a>.</li>
+</ul>
+<p>To help, turn on check-ins: <code>steer checkin on</code></p>
+`;
+}

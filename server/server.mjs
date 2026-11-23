@@ -15,14 +15,17 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { Worker, isMainThread, parentPort } from "node:worker_threads";
 import {
+  accuracy,
   applyCaps,
   buildReport,
+  checkinMoments,
   checks,
   fmtDur,
   hoursOf,
   projectAgent,
   projectBetween,
   projectHuman,
+  renderAccuracy,
   renderReport,
   renderReview,
   renderWeekly,
@@ -75,6 +78,9 @@ const JOB_SECS = 30; // a page that takes longer is given up on for a while
 // ---------- storage ----------
 
 const usersFile = join(DATA, "users.json");
+// Accounts that ever sent a check-in answer, so /accuracy only reads those.
+const checkinersFile = join(DATA, "checkin-accounts.json");
+const ACCURACY_EVERY = 15 * 60_000; // ms, /accuracy is worked out again at most this often
 // Review pages, one file each, never changed once written.
 const REVIEWS = join(DATA, "reviews");
 const reviewFile = (id) => join(REVIEWS, `${id}.json`);
@@ -496,6 +502,13 @@ function workerMain() {
 
   async function job({ op, name, version, project, from, to, info }) {
     const projects = await projectsOf(name, version);
+    if (op === "checkins") {
+      const answers = [];
+      await eachEvent(name, (e) => {
+        if (e.kind === "checkin" && !e.late && typeof e.answer === "string") answers.push({ t: Date.parse(e.t), answer: e.answer });
+      });
+      return answers.length ? checkinMoments(projects, await sessionsOf(name), answers) : [];
+    }
     if (op === "commits") {
       const whole = projects.find((x) => x.name === project);
       return whole ? reviewFacts(projectBetween(whole, from, to)).commits : [];
@@ -633,6 +646,60 @@ const reportOf = (name, store) =>
 
 const projectOf = (name, store, project) =>
   cached(`p\n${name}\n${project}`, name, store, { op: "project", project }, (v) => v?.length ?? 0);
+
+// ---------- accuracy ----------
+
+let checkiners = null; // Set of account names, read or found on first use
+
+/** Accounts that sent check-in answers. The first time, without the file, it looks
+ * through everyone's events once. */
+async function checkinAccounts() {
+  if (!checkiners) {
+    if (existsSync(checkinersFile)) {
+      checkiners = new Set(JSON.parse(readFileSync(checkinersFile, "utf8")));
+    } else {
+      const found = new Set();
+      for (const name of Object.keys(users)) {
+        let any = false;
+        await eachEvent(name, (e) => {
+          if (e.kind === "checkin") any = true;
+        });
+        if (any) found.add(name);
+      }
+      checkiners = found;
+      saveCheckiners();
+    }
+  }
+  return [...checkiners].filter(hasUser);
+}
+
+function saveCheckiners() {
+  writeFileSync(checkinersFile + ".tmp", JSON.stringify([...checkiners]));
+  renameSync(checkinersFile + ".tmp", checkinersFile);
+}
+
+let accuracyPage = null; // { at, html }
+let accuracyWorking = null;
+
+/** The /accuracy page, from everyone's check-ins, worked out at most every ACCURACY_EVERY. */
+function accuracyHtml() {
+  if (accuracyPage && Date.now() - accuracyPage.at < ACCURACY_EVERY) return Promise.resolve(accuracyPage.html);
+  if (!accuracyWorking) {
+    accuracyWorking = (async () => {
+      const people = [];
+      for (const name of await checkinAccounts()) {
+        const store = await storeOf(name);
+        people.push(await cached(`c\n${name}`, name, store, { op: "checkins" }, (v) => v.length * 80));
+      }
+      const updated = new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC";
+      const html = renderAccuracy(accuracy(people), { updated });
+      accuracyPage = { at: Date.now(), html };
+      return html;
+    })().finally(() => (accuracyWorking = null));
+  }
+  // Show the last one while a new one is worked out.
+  return accuracyPage ? Promise.resolve(accuracyPage.html) : accuracyWorking;
+}
 
 // ---------- http ----------
 
@@ -1437,6 +1504,10 @@ async function postEvents(req, res) {
   if (fresh.length) {
     appendFileSync(eventsFile(name), fresh.map((e) => JSON.stringify(e) + "\n").join(""));
     for (const e of fresh) note(store, e);
+    if (checkiners && !checkiners.has(name) && fresh.some((e) => e.kind === "checkin")) {
+      checkiners.add(name);
+      saveCheckiners();
+    }
   }
   return json(res, 200, { accepted: fresh.length, late: fresh.filter((e) => e.late).length, dropped, skew_secs: Math.round(skew / 1000) });
 }
@@ -1454,6 +1525,10 @@ async function handle(req, res) {
   if (req.method === "GET" && Object.hasOwn(STATIC, path)) {
     const [file, type] = STATIC[path];
     return send(res, 200, readFileSync(join(WEB, file)), type);
+  }
+
+  if (req.method === "GET" && path === "/accuracy") {
+    return page(res, "steer · accuracy", await accuracyHtml());
   }
 
   if (req.method === "POST" && path === "/api/signup") {
