@@ -4,7 +4,7 @@
 
 steer tracks the time you spend working with ai coding agents. the time the agent runs by itself doesnt count, only what you do around it, like writing prompts, reading what it did, testing and fixing stuff. made for hack club's ai time tracking bounty.
 
-works with claude code, codex, opencode, copilot (vs code and cli), cursor and freebuff.
+works with claude code, codex, opencode, copilot (vs code and cli), cursor and freebuff, and with the browser extension, chatgpt and claude on the web.
 
 ## install
 
@@ -35,8 +35,19 @@ steer uninstall
 - claude code and cursor run `steer hook` on every prompt, tool call and when the agent finishes
 - codex, opencode, copilot and freebuff dont have hooks like that, so a small background watcher (`steer watch`) reads their session logs every 5 seconds. it uses about 0.2% cpu
 - the watcher also looks at the git repos you used an ai tool in during the last hour, every 30 seconds, to see when you change code or commit yourself. that counts the time you spend coding and testing by hand between prompts, within 30 minutes of using an ai tool. a change only counts if the agent wasn't editing right then, and saving a file without changing it or undoing back to how it was doesnt count. it only lists files with git and compares them itself, so nothing in a repo's own git settings can run
+- for chatgpt and claude on the web there's a browser extension. it sees when you send a message and when the answer is done, works out the prompt's counts right there in the browser, and gives only the counts to steer on your computer
 - events go into a queue in `~/.steer` and get sent to the server in the background, so your tools never wait on the network
 - the server stamps each event when it arrives. anything more than 5 minutes off doesnt count, so you cant make up old sessions later
+
+## chatgpt and claude in the browser
+
+the extension isnt on the chrome web store yet, so for now:
+
+1. run `steer update` and then `steer setup`, which lets chrome start steer
+2. download this repo, go to `chrome://extensions`, turn on developer mode, click "load unpacked" and pick the `extension` folder
+3. click the steer icon to pick which project your chats count toward. if you dont pick one, they go to the repo you last used an ai tool in
+
+it works in chrome, edge, brave, arc, vivaldi and chromium. while the answer is being written nothing counts, same as an agent running. reading it and writing your next message does.
 
 ## privacy
 
@@ -48,6 +59,8 @@ when you change code or commit in a repo you used ai in, the watcher sends one o
 
 `save: id, project, time, count (how many files changed)`
 `commit: id, project, time, hash`
+
+chats in the browser send the same counts as a prompt, with via `chatgpt` or `claude-ai`. the extension only runs on chatgpt.com and claude.ai, and the only thing it asks chrome for is talking to steer on your computer.
 
 each batch of events also says what time your computer thinks it is, so if your clock is off the server can fix the times instead of dropping them.
 

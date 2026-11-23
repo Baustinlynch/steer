@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "steer",
+  "version": "0.1.0",
+  "description": "Tracks the time you spend coding with ChatGPT and Claude in the browser, for steer. Prompt text never leaves your computer.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxSyxplU1fGge0zcH9c1OFLZRmo35666K87EVfzdpj90ASQvKd/vlDC234ePbgjmTJomC3QQR2AzfF1nuPXWLr3mxbLgQcv+HcxDYTRuryWwx07Lg2UHNfLoxgNcSvj6E4gnWDPkohbPSAyX7Or/n+4oDZmh1vwKsHbokKiEQhdga43QvOrPMz2BNghnrrs+eqME3KBmalmv/2plWHgvvSjOgcMi/s+qJoaySiwQWQ5rsxFX0/o7xuT71C2IXEkne6z+ddZqWn4WbSxSmXLCXGLfVrTNAnmJJXtGDz+ZWNhALfsQTCmp+p/cYyZ0yiRZr+IT5qD5Y5LzoAYXWz4XdBwIDAQAB",
+  "permissions": ["nativeMessaging"],
+  "background": { "service_worker": "worker.js", "type": "module" },
+  "content_scripts": [
+    { "matches": ["https://chatgpt.com/*", "https://claude.ai/*"], "js": ["page.js"], "world": "MAIN", "run_at": "document_start" },
+    { "matches": ["https://chatgpt.com/*", "https://claude.ai/*"], "js": ["bridge.js"], "run_at": "document_start" }
+  ],
+  "action": { "default_popup": "popup.html", "default_title": "steer" }
+}

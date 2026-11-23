@@ -26,8 +26,15 @@ mkdirSync(join(home, "proj"));
 // STEER_SANDBOX keeps steer away from things that aren't under HOME (launchd, systemd,
 // the registry, the Windows PATH).
 const env = { ...process.env, HOME: home, USERPROFILE: home, STEER_NO_BROWSER: "1", STEER_SANDBOX: "1" };
-for (const k of ["STEER_HOME", "CODEX_HOME", "COPILOT_HOME", "XDG_DATA_HOME", "ZDOTDIR", "STEER_NO_UPDATE", "HCA_CLIENT_ID", "HCA_CLIENT_SECRET"]) delete env[k];
+for (const k of ["STEER_HOME", "CODEX_HOME", "COPILOT_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "ZDOTDIR", "STEER_NO_UPDATE", "HCA_CLIENT_ID", "HCA_CLIENT_SECRET"]) delete env[k];
 env.STEER_RELEASES = `http://127.0.0.1:${RELEASES_PORT}/releases`;
+
+// Chrome is "installed", so install registers steer for the browser extension. (Windows
+// keeps that in the registry, which STEER_SANDBOX leaves alone.)
+const EXTENSION = "chrome-extension://badjomjdmajniieefpgbnglnocamhmck/";
+const chromeDir = process.platform === "darwin" ? join(home, "Library", "Application Support", "Google", "Chrome") : join(home, ".config", "google-chrome");
+const hostManifest = join(chromeDir, "NativeMessagingHosts", "app.steer.native.json");
+if (!windows) mkdirSync(chromeDir, { recursive: true });
 
 // On Mac and Linux install adds steer to the PATH in the shell's startup file.
 env.SHELL = "/bin/bash";
@@ -105,6 +112,11 @@ try {
   const settings = JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8"));
   assert.ok(settings.hooks.UserPromptSubmit[0].hooks[0].command.includes(join(".steer", "bin")));
   assert.match(await steer(bin, []), /account: ci/, "plain steer shows the status once it's set up");
+  if (!windows) {
+    const host = JSON.parse(readFileSync(hostManifest, "utf8"));
+    assert.equal(host.path, bin, "chrome starts the installed steer");
+    assert.deepEqual(host.allowed_origins, [EXTENSION], "and only for steer's extension");
+  }
   if (!windows) assert.match(readFileSync(startup, "utf8"), /^echo hi\n\n# added by steer.*\nexport PATH=".*\.steer.bin:\$PATH"\n$/);
 
   // 2. A prompt in Claude Code reaches the server, with counts and no text.
@@ -157,6 +169,33 @@ try {
   assert.equal(s2Prompts().length, 1, "only the typed prompt is sent");
   assert.ok(!readFileSync(eventsFile, "utf8").includes(log), "the log's path never leaves the computer");
 
+  // A prompt on ChatGPT, through the browser extension. Chrome starts steer with the
+  // extension's origin and they talk in messages of a 4-byte length and then JSON.
+  async function fromBrowser(message) {
+    const child = spawn(bin, [EXTENSION], { env });
+    let out = Buffer.alloc(0);
+    child.stdout.on("data", (d) => (out = Buffer.concat([out, d])));
+    const body = Buffer.from(JSON.stringify(message));
+    const length = Buffer.alloc(4);
+    length.writeUInt32LE(body.length);
+    child.stdin.end(Buffer.concat([length, body]));
+    const code = await new Promise((ok) => child.on("close", ok));
+    assert.equal(code, 0);
+    assert.equal(out.readUInt32LE(0), out.length - 4, "one whole message back, nothing else on stdout");
+    return JSON.parse(out.subarray(4).toString());
+  }
+  const shown = await fromBrowser({ kind: "projects" });
+  assert.equal(shown.signed_in, true);
+  assert.equal(shown.user, "ci");
+  const counts = { via: "chatgpt", session: "chatgpt-t-7", words: 14, chars: 80, images: 1, specific: 2, observation: true, generic: false, repeat: false };
+  assert.deepEqual(await fromBrowser({ kind: "prompt", ...counts }), { ok: true });
+  const fromChatgpt = () => readFileSync(eventsFile, "utf8").split("\n").filter((l) => l.includes('"session":"chatgpt:chatgpt-t-7"'));
+  // The host starts a flush itself, like the hooks do.
+  await until("the chatgpt prompt to reach the server", () => fromChatgpt().length > 0);
+  assert.match(fromChatgpt()[0], /"via":"chatgpt"/);
+  assert.match(fromChatgpt()[0], /"words":14/);
+  assert.deepEqual(await fromBrowser({ kind: "prompt", ...counts, via: "somewhere-else" }), { ok: false });
+
   // 3. The watcher starts and checks in.
   console.log("step 3");
   watcher = spawn(bin, ["watch"], { env, stdio: "ignore" });
@@ -188,6 +227,7 @@ try {
   watcher.kill();
   const removed = await steer(bin, ["uninstall", "--yes"]);
   assert.match(removed, /took 3 steer hooks out/);
+  if (!windows) assert.ok(!existsSync(hostManifest), "chrome can't start steer anymore");
   const after = JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8"));
   assert.equal(after.hooks, undefined, "no steer hooks left in claude code settings");
   await until("~/.steer to be deleted", () => !existsSync(steerDir));

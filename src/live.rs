@@ -355,7 +355,7 @@ pub(crate) fn flushing() -> bool {
         .is_some_and(|age| age < Duration::from_secs(60))
 }
 
-fn spawn_flush() {
+pub(crate) fn spawn_flush() {
     let Ok(exe) = std::env::current_exe() else { return };
     let mut cmd = Command::new(exe);
     cmd.arg("flush").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -597,6 +597,7 @@ pub(crate) fn setup_all(remove: bool, watch: bool) -> Result<String, String> {
     if watch {
         msg += &format!("\n{}", crate::watch::autostart(remove)?);
     }
+    msg += &format!("\n{}", crate::native::install(remove));
     Ok(msg)
 }
 

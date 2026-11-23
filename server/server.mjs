@@ -201,7 +201,7 @@ const KINDS = new Set(["prompt", "tool", "stop", "interrupt", "checkin", "run", 
 const EVIDENCE = new Set(["run", "save", "commit"]);
 // The tools steer tracks. Only Codex and Copilot write down a stopped turn; the
 // Claude Code and Cursor hooks and OpenCode never send an interrupt.
-const VIAS = new Set(["claude-code", "cursor", "codex", "opencode", "copilot", "freebuff", "steer"]);
+const VIAS = new Set(["claude-code", "cursor", "codex", "opencode", "copilot", "freebuff", "chatgpt", "claude-ai", "steer"]);
 // Check-ins (`steer checkin on`): the person's answer to "what are you doing right now?",
 // used to fit the credit curve. They come from steer itself and never count as time.
 const ANSWERS = new Set(["project-ai", "project", "other", "none"]);

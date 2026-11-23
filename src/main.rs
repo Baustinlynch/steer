@@ -7,6 +7,7 @@ mod freebuff;
 mod claude;
 mod git;
 mod live;
+mod native;
 mod manage;
 mod model;
 mod opencode;
@@ -96,6 +97,10 @@ fn main() {
     #[cfg(windows)]
     stop_handle_inheritance();
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // Chrome starts steer with the extension's origin when the extension talks to it.
+    if native::started_by_browser(&argv) {
+        std::process::exit(native::run());
+    }
     match argv.first().map(String::as_str) {
         None => std::process::exit(manage::bare()),
         Some("hook") => return live::hook(&argv[1..]),
