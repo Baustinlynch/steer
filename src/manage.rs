@@ -190,6 +190,8 @@ pub fn install(args: &[String]) -> Result<String, String> {
                 Err(e) => println!("{e}"),
             }
         }
+        // Asked here, so the watcher won't ask again.
+        crate::checkin::mark_offered();
     }
 
     let config = load_config().ok_or("not signed in")?;

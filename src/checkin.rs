@@ -18,6 +18,13 @@ const BLOCK: u64 = 20 * 60;
 const ACTIVE: u64 = 60 * 60;
 /// No answer after this counts as "none", which usually means away.
 const WAIT: u64 = 90;
+/// People who installed before install asked about check-ins get asked once by the
+/// watcher, only while they're clearly at the computer, and at most 3 times a day apart
+/// if they never click either button.
+const OFFER_ACTIVE: u64 = 10 * 60;
+const OFFER_TRIES: u32 = 3;
+const DAY: u64 = 24 * 60 * 60;
+const OFFER_BUTTONS: [&str; 2] = ["no thanks", "yes, turn them on"];
 
 const QUESTION: &str = "what are you doing right now?";
 /// The buttons, and what each one is sent as.
@@ -60,6 +67,7 @@ pub fn command(args: &[String]) -> Result<String, String> {
             }
             fs::create_dir_all(dir()).map_err(|e| e.to_string())?;
             fs::write(flag(), "").map_err(|e| e.to_string())?;
+            mark_offered();
             Ok(format!(
                 "check-ins are on. while you use an ai tool, steer asks \"{QUESTION}\" once at a random moment every {} minutes.\n\
                  your answers help set how steer counts the time between prompts. they only send which button you picked, and they never count as time.\n\
@@ -69,6 +77,8 @@ pub fn command(args: &[String]) -> Result<String, String> {
         }
         Some("off") => {
             let _ = fs::remove_file(flag());
+            // Turned off on purpose, so the watcher never asks to turn them back on.
+            mark_offered();
             Ok("check-ins are off".into())
         }
         Some("now") => {
@@ -124,7 +134,11 @@ static ASKING: AtomicBool = AtomicBool::new(false);
 /// Called by the watcher every few seconds. Asks in the background when it's time.
 pub fn tick(schedule: &mut Schedule) {
     let now = now();
-    if !schedule.due(now, block()) || !on() || !active(now) || ASKING.swap(true, Ordering::SeqCst) {
+    if !on() {
+        offer(now);
+        return;
+    }
+    if !schedule.due(now, block()) || !active(now, ACTIVE) || ASKING.swap(true, Ordering::SeqCst) {
         return;
     }
     std::thread::spawn(|| {
@@ -133,13 +147,82 @@ pub fn tick(schedule: &mut Schedule) {
     });
 }
 
-/// Whether an AI tool was used recently. `enqueue` notes the time of every event except
-/// check-ins, so answering doesn't keep the questions going.
-fn active(now: u64) -> bool {
+/// Whether an AI tool was used in the last `within` seconds. `enqueue` notes the time of
+/// every event except check-ins, so answering doesn't keep the questions going.
+fn active(now: u64, within: u64) -> bool {
     fs::read_to_string(dir().join("last-activity"))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .is_some_and(|t| now.saturating_sub(t) <= ACTIVE)
+        .is_some_and(|t| now.saturating_sub(t) <= within)
+}
+
+// ---------- asking once whether to turn check-ins on ----------
+
+fn offered_file() -> PathBuf {
+    dir().join("checkin-offered")
+}
+
+#[derive(Debug, PartialEq)]
+enum Offered {
+    Not,
+    /// Someone clicked a button (here or in install), or turned check-ins on or off.
+    Answered,
+    /// Asked this many times, the last at this time, and nobody clicked.
+    Tries(u32, u64),
+}
+
+fn offered() -> Offered {
+    let Ok(s) = fs::read_to_string(offered_file()) else { return Offered::Not };
+    let mut parts = s.split_whitespace();
+    match (parts.next(), parts.next().and_then(|n| n.parse().ok()), parts.next().and_then(|t| t.parse().ok())) {
+        (Some("tries"), Some(n), Some(t)) => Offered::Tries(n, t),
+        // "answered", or anything strange: don't ask.
+        _ => Offered::Answered,
+    }
+}
+
+fn offer_due(state: &Offered, now: u64) -> bool {
+    match state {
+        Offered::Not => true,
+        Offered::Answered => false,
+        Offered::Tries(n, last) => *n < OFFER_TRIES && now.saturating_sub(*last) >= DAY,
+    }
+}
+
+/// So the watcher never asks: install asked already, or check-ins were turned on or off.
+pub fn mark_offered() {
+    let _ = fs::create_dir_all(dir());
+    let _ = fs::write(offered_file(), "answered");
+}
+
+/// Asks whether to turn check-ins on, if it's time to. In the background, like the
+/// questions themselves.
+fn offer(now: u64) {
+    if std::env::var_os("STEER_SANDBOX").is_some() || !active(now, OFFER_ACTIVE) {
+        return;
+    }
+    let state = offered();
+    if !offer_due(&state, now) || !can_ask() || ASKING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let tries = if let Offered::Tries(n, _) = state { n + 1 } else { 1 };
+    // Written first, so a crash or a closed laptop can't make it ask over and over.
+    let _ = fs::create_dir_all(dir());
+    let _ = fs::write(offered_file(), format!("tries {tries} {now}"));
+    std::thread::spawn(|| {
+        let text = format!(
+            "want to help check that steer's numbers are right? while you use an ai tool, steer would ask \"{QUESTION}\" once every {} minutes, with 3 buttons. it closes by itself after {WAIT} seconds, and answers never count as time. you can stop it anytime with: steer checkin off",
+            every_minutes()
+        );
+        match dialog(&text, &OFFER_BUTTONS).as_deref() {
+            Some(b) if b == OFFER_BUTTONS[1] => {
+                let _ = command(&["checkin".into(), "on".into()]);
+            }
+            Some(_) => mark_offered(),
+            None => {}
+        }
+        ASKING.store(false, Ordering::SeqCst);
+    });
 }
 
 fn ask_and_send() -> &'static str {
@@ -167,30 +250,40 @@ fn dialog_tool() -> Option<&'static str> {
 
 /// Shows the question and returns the answer's code, or None if nobody clicked.
 fn ask() -> Option<&'static str> {
-    let label = match dialog_tool()? {
+    let labels: Vec<&str> = BUTTONS.iter().map(|(l, _)| *l).collect();
+    let clicked = dialog(QUESTION, &labels)?;
+    BUTTONS.iter().find(|(l, _)| *l == clicked).map(|(_, code)| *code)
+}
+
+/// A small window with `text` and `buttons`, closing itself after WAIT seconds. Returns
+/// the button clicked, or None if nobody clicked.
+fn dialog(text: &str, buttons: &[&str]) -> Option<String> {
+    let clicked = match dialog_tool()? {
         "osascript" => {
-            let buttons = BUTTONS.iter().map(|(l, _)| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
+            let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+            let list = buttons.iter().map(|b| quote(b)).collect::<Vec<_>>().join(", ");
             // No default button, so pressing enter while typing doesn't answer it by accident.
-            let script = format!(
-                "button returned of (display dialog \"{QUESTION}\" with title \"steer check\" buttons {{{buttons}}} giving up after {WAIT})"
-            );
+            let script =
+                format!("button returned of (display dialog {} with title \"steer check\" buttons {{{list}}} giving up after {WAIT})", quote(text));
             output(Command::new("osascript").args(["-e", &script]))?
         }
         "powershell" => {
             let mut cmd = Command::new("powershell");
-            cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", &encoded(&windows_dialog())]);
+            cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", &encoded(&windows_dialog(text, buttons))]);
             output(&mut cmd)?
         }
         _ => {
+            // zenity's text is markup.
+            let text = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
             let mut cmd = Command::new("zenity");
-            cmd.args(["--question", "--switch", "--title", "steer check", "--text", QUESTION, "--timeout", &WAIT.to_string()]);
-            for (l, _) in BUTTONS {
-                cmd.args(["--extra-button", l]);
+            cmd.args(["--question", "--switch", "--title", "steer check", "--text", &text, "--timeout", &WAIT.to_string()]);
+            for b in buttons {
+                cmd.args(["--extra-button", b]);
             }
             output(&mut cmd)?
         }
     };
-    BUTTONS.iter().find(|(l, _)| *l == label).map(|(_, code)| *code)
+    buttons.iter().find(|b| **b == clicked).map(|b| (*b).to_owned())
 }
 
 fn output(cmd: &mut Command) -> Option<String> {
@@ -198,26 +291,32 @@ fn output(cmd: &mut Command) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// A small always-on-top window with the three buttons, closing itself after WAIT seconds.
-fn windows_dialog() -> String {
-    let buttons = BUTTONS.iter().map(|(l, _)| format!("'{l}'")).collect::<Vec<_>>().join(",");
+/// The Windows window: always on top, the text wrapped, a button each.
+fn windows_dialog(text: &str, buttons: &[&str]) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let list = buttons.iter().map(|b| quote(b)).collect::<Vec<_>>().join(",");
     format!(
         "Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 $f = New-Object Windows.Forms.Form
-$f.Text = 'steer check'; $f.TopMost = $true; $f.Width = 540; $f.Height = 140
+$f.Text = 'steer check'; $f.TopMost = $true; $f.Width = 540
 $f.StartPosition = 'CenterScreen'; $f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false
-$q = New-Object Windows.Forms.Label; $q.Text = '{QUESTION}'; $q.AutoSize = $true; $q.Left = 12; $q.Top = 14; $f.Controls.Add($q)
+$q = New-Object Windows.Forms.Label; $q.Text = {}; $q.Left = 12; $q.Top = 14
+$q.AutoSize = $true; $q.MaximumSize = New-Object Drawing.Size(500, 0); $f.Controls.Add($q)
+$y = $q.Top + $q.GetPreferredSize((New-Object Drawing.Size(500, 0))).Height + 14
 $script:answer = ''
 $x = 12
-foreach ($t in @({buttons})) {{
-  $b = New-Object Windows.Forms.Button; $b.Text = $t; $b.AutoSize = $true; $b.Left = $x; $b.Top = 48
+foreach ($t in @({list})) {{
+  $b = New-Object Windows.Forms.Button; $b.Text = $t; $b.AutoSize = $true; $b.Left = $x; $b.Top = $y
   $b.Add_Click({{ $script:answer = $this.Text; $f.Close() }})
   $f.Controls.Add($b); $x += 170
 }}
+$f.Height = $y + 80
 $timer = New-Object Windows.Forms.Timer; $timer.Interval = {}; $timer.Add_Tick({{ $f.Close() }}); $timer.Start()
 [void]$f.ShowDialog()
 Write-Output $script:answer
 ",
+        quote(text),
         WAIT * 1000
     )
 }
@@ -243,6 +342,32 @@ fn encoded(script: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asks_to_turn_check_ins_on_at_most_three_times_a_day_apart() {
+        live::use_temp_home();
+        fs::create_dir_all(dir()).unwrap();
+        let _ = fs::remove_file(offered_file());
+        assert_eq!(offered(), Offered::Not);
+        assert!(offer_due(&Offered::Not, 1000));
+        fs::write(offered_file(), "tries 1 1000").unwrap();
+        assert_eq!(offered(), Offered::Tries(1, 1000));
+        assert!(!offer_due(&offered(), 1000 + DAY - 1), "not twice in a day");
+        assert!(offer_due(&offered(), 1000 + DAY));
+        assert!(!offer_due(&Offered::Tries(OFFER_TRIES, 0), 10 * DAY), "and not more than 3 times");
+        mark_offered();
+        assert_eq!(offered(), Offered::Answered);
+        assert!(!offer_due(&offered(), 10 * DAY), "never again once someone answers");
+        fs::write(offered_file(), "garbled").unwrap();
+        assert!(!offer_due(&offered(), 10 * DAY), "a file steer can't read means don't ask");
+    }
+
+    #[test]
+    fn dialogs_quote_their_text() {
+        let script = windows_dialog("steer's \"numbers\"", &["no thanks", "yes"]);
+        assert!(script.contains("$q.Text = 'steer''s \"numbers\"'"));
+        assert!(script.contains("@('no thanks','yes')"));
+    }
 
     #[test]
     fn asks_once_per_block_at_a_random_moment() {
