@@ -521,9 +521,15 @@ pub fn doctor() -> i32 {
 
     let claude = live::home().join(".claude").exists();
     let claude_on = live::hooks_installed(&live::claude_settings());
+    let claude_version = crate::claude::newest_version(&live::home().join(".claude").join("projects"))
+        .map(|(a, b, c)| format!(" (claude code {a}.{b}.{c})"))
+        .unwrap_or_default();
     checks.push(match (claude, claude_on) {
-        (_, true) => Check::Ok("claude code hooks are on".into()),
-        (true, false) => Check::Fix("claude code hooks are off, run steer setup".into()),
+        (_, true) => Check::Ok(format!("claude code hooks are on{claude_version}")),
+        (true, false) if live::some_hooks_installed(&live::claude_settings()) => {
+            Check::Fix(format!("some claude code hooks are missing{claude_version}, run steer setup (the watcher adds them by itself after an update)"))
+        }
+        (true, false) => Check::Fix(format!("claude code hooks are off{claude_version}, run steer setup")),
         (false, false) => Check::Info("claude code isn't installed".into()),
     });
     checks.push(match (live::cursor_dir().exists(), live::cursor_hooks_installed()) {
@@ -535,6 +541,13 @@ pub fn doctor() -> i32 {
         Check::Ok("the watcher (codex, opencode, copilot, freebuff, saves and commits) is running".into())
     } else {
         Check::Fix("the watcher (codex, opencode, copilot, freebuff, saves and commits) isn't running, run steer setup".into())
+    });
+    checks.push(match crate::idle::seconds() {
+        Some(_) => Check::Ok("can tell when you're away from the computer (idle time)".into()),
+        None if cfg!(target_os = "linux") => {
+            Check::Info("can't tell when you're away from the computer here. on x11, install xprintidle (gnome works without it). steer counts as before without it".into())
+        }
+        None => Check::Info("can't tell when you're away from the computer here. steer counts as before without it".into()),
     });
     if let Some(note) = live::clock_note() {
         checks.push(Check::Info(note));

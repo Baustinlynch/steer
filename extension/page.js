@@ -32,6 +32,62 @@
     document.addEventListener("click", (e) => e.target?.closest?.(CLAUDE_SEND) && grab(), true);
   }
 
+  // Whether this chat is what the person is looking at: the tab showing and its window in
+  // front. Sent each time that changes, so reading counts whether or not they scroll. The
+  // idle timer in the steer app says whether anyone's at the computer at all. A change
+  // that lasts under a second (alt-tabbing past it) isn't sent; one that does is stamped
+  // with when it happened.
+  let focused = null; // what was last sent
+  let pending = null;
+  const inFront = () => document.visibilityState === "visible" && document.hasFocus();
+  const checkFocus = () => {
+    const now = inFront();
+    clearTimeout(pending);
+    if (now === focused) return;
+    const at = Date.now();
+    pending = setTimeout(() => {
+      if (inFront() !== now || now === focused) return;
+      focused = now;
+      tell({ type: "focus", on: now, at });
+    }, 1000);
+  };
+  window.addEventListener("focus", checkFocus);
+  window.addEventListener("blur", checkFocus);
+  document.addEventListener("visibilitychange", checkFocus);
+  window.addEventListener("pagehide", () => {
+    clearTimeout(pending);
+    if (focused) tell({ type: "focus", on: false, at: Date.now() });
+    focused = false;
+  });
+  // Not at document_start: the extension's side isn't listening yet.
+  document.addEventListener("DOMContentLoaded", checkFocus);
+
+  // Copying out of the chat, at most every 5 seconds.
+  let copied = 0;
+  document.addEventListener(
+    "copy",
+    () => {
+      if (Date.now() - copied < 5000 || !inFront()) return;
+      copied = Date.now();
+      tell({ type: "copy" });
+    },
+    true,
+  );
+
+  // The first key typed in the message box since the last message went out: when
+  // writing the next prompt started.
+  let composing = false;
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (composing || e.key?.length !== 1 || e.ctrlKey || e.metaKey) return;
+      if (!e.target?.closest?.('[contenteditable="true"], textarea')) return;
+      composing = true;
+      tell({ type: "typing" });
+    },
+    true,
+  );
+
   /** What a request to the site's own server says about a sent message, or null. */
   function sentMessage(url, method, body) {
     if (site === "chatgpt") {
@@ -117,6 +173,7 @@
           const id = Math.random().toString(36).slice(2);
           tell({ type: "prompt", id, text: sent.text, images: sent.images, previous });
           previous = sent.text;
+          composing = false;
           result.then(
             (response) => whenDone(response, id),
             () => tell({ type: "stop", id }),

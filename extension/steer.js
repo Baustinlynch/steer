@@ -550,6 +550,19 @@ function projectName(cwd) {
   return parts.length ? parts[parts.length - 1] : cwd;
 }
 
+/**
+ * Which project a name belongs to, whatever its folder is called on each computer: a
+ * folder made by hand as "Vault Books" and a clone called "vault-books" (or
+ * "vault_books") are one project. Capitals don't matter, and spaces, dashes and
+ * underscores between words all count the same.
+ */
+export function projectKey(name) {
+  return String(name ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "-");
+}
+
 // Evidence counts as part of the AI session it happened during or right after: within
 // this long after something from the AI tool (a prompt, a tool call, a stop), not after
 // other evidence, so a stream of saves can't keep itself going.
@@ -566,8 +579,8 @@ function mergeEvidence(sessions) {
   const ai = sessions.filter((s) => !s.evidence).map((s) => ({ ...s, events: [...s.events] }));
   const out = [...ai];
   for (const ev of sessions.filter((s) => s.evidence)) {
-    const name = projectName(ev.cwd);
-    const mine = ai.filter((s) => projectName(s.cwd) === name && s.events.length);
+    const key = projectKey(projectName(ev.cwd));
+    const mine = ai.filter((s) => projectKey(projectName(s.cwd)) === key && s.events.length);
     const alone = [];
     for (const e of ev.events) {
       let best = null;
@@ -607,9 +620,13 @@ export function buildReport(sessions, { days = 30, now = Date.now(), rule = RULE
     if (cutoff !== null && events[events.length - 1].t < cutoff) continue;
     const rep = analyzeSession({ ...s, events }, rule);
     if (rep.turns.length === 0) continue;
+    // One project per key, named the way it was most recently (sessions go oldest first).
     const name = projectName(s.cwd);
-    if (!byName.has(name)) byName.set(name, { name, sessions: [] });
-    byName.get(name).sessions.push(rep);
+    const key = projectKey(name);
+    if (!byName.has(key)) byName.set(key, { name, sessions: [] });
+    const p = byName.get(key);
+    p.name = name;
+    p.sessions.push(rep);
   }
 
   const projects = [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));

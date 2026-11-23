@@ -62,9 +62,18 @@ when you change code or commit in a repo you used ai in, the watcher sends one o
 
 chats in the browser send the same counts as a prompt, with via `chatgpt` or `claude-ai`. the extension only runs on chatgpt.com and claude.ai, and the only thing it asks chrome for is talking to steer on your computer.
 
+steer also collects a few signs of what you're doing, so it can count your time from what you actually do instead of guessing from gaps. they don't count toward anything yet:
+
+`wait: id, session, project, time, reason`: claude code showed you a permission prompt (only that it did, nothing about the tool or the command)
+`focus: id, session, project, time, on`: a chatgpt or claude tab came to the front, or stopped being there
+`copy / typing: id, session, project, time`: you copied something out of a chatgpt or claude tab, or started typing your next message there (never the text)
+`away / back / here: id, time, away_secs`: from your computer's idle timer, only within an hour of using an ai tool. away when nobody touched the keyboard or mouse for 2 minutes, back when someone does again (with how long they were gone), and here every 5 minutes while someone's there. the idle timer is one number of seconds, with no app names and nothing about what you typed
+
+prompts also say which permission mode claude code or codex was in (like default or never), and tool events say how long the tool ran.
+
 each batch of events also says what time your computer thinks it is, so if your clock is off the server can fix the times instead of dropping them.
 
-project is the name of the git repo or folder you were in (your home folder shows up as "home"). your page is public.
+project is the name of the git repo or folder you were in (your home folder shows up as "home"). names that only differ in capitals, spaces, dashes or underscores are one project, so "Vault Books" on one computer and a clone called "vault-books" on another add up together. your page is public.
 
 ## how time is counted
 

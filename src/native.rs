@@ -78,11 +78,22 @@ pub(crate) fn handle(m: &Value) -> Value {
             let _ = fs::create_dir_all(dir());
             json!({ "ok": fs::write(dir().join("browser-project"), name).is_ok() })
         }
-        Some(kind @ ("prompt" | "stop")) => {
+        Some(kind @ ("prompt" | "stop" | "focus" | "copy" | "typing")) => {
             let Some(via) = m["via"].as_str().filter(|v| VIAS.contains(v)) else { return json!({ "ok": false }) };
             let session: String = m["session"].as_str().unwrap_or("browser").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(80).collect();
             let session = format!("{via}:{session}");
-            let mut e = event(new_id(), &session, &project(), via, Utc::now(), kind);
+            // When it happened in the browser, if that's a sane time (it's the same clock).
+            let now = Utc::now();
+            let at = m["at"]
+                .as_i64()
+                .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
+                .filter(|t| (now - *t).num_seconds().abs() <= 60)
+                .unwrap_or(now);
+            let mut e = event(new_id(), &session, &project(), via, at, kind);
+            if kind == "focus" {
+                let Some(on) = m["on"].as_bool() else { return json!({ "ok": false }) };
+                e["on"] = on.into();
+            }
             if kind == "prompt" {
                 let count = |k: &str, max: u64| m[k].as_u64().unwrap_or(0).min(max);
                 let words = count("words", 100_000);
@@ -152,6 +163,9 @@ mod tests {
         assert_eq!(handle(&json!({ "kind": "prompt", "via": "evil", "session": "x" }))["ok"], false);
         assert_eq!(handle(&json!({ "kind": "set-project", "name": "../../etc" }))["ok"], false);
         assert_eq!(handle(&json!({ "kind": "nope" }))["ok"], false);
+        assert_eq!(handle(&json!({ "kind": "focus", "via": "chatgpt", "session": "x", "on": "yes" }))["ok"], false, "focus is on or off");
+        assert_eq!(handle(&json!({ "kind": "focus", "via": "chatgpt", "session": "x", "on": true, "at": 5 }))["ok"], true, "a strange time is replaced by now");
+        assert_eq!(handle(&json!({ "kind": "keys", "via": "chatgpt", "session": "x" }))["ok"], false);
         assert!(started_by_browser(&["chrome-extension://badjomjdmajniieefpgbnglnocamhmck/".into()]));
         assert!(!started_by_browser(&["watch".into()]));
     }

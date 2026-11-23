@@ -12,6 +12,28 @@ pub struct Project {
     pub sessions: Vec<SessionReport>,
 }
 
+/// Which project a name belongs to, whatever its folder is called on each computer: a
+/// folder made by hand as "Vault Books" and a clone called "vault-books" (or
+/// "vault_books") are one project. Capitals don't matter, and spaces, dashes and
+/// underscores between words all count the same. The same rule as projectKey in
+/// web/steer.js.
+pub fn project_key(name: &str) -> String {
+    let mut key = String::new();
+    let mut gap = false;
+    for c in name.trim().chars().flat_map(char::to_lowercase) {
+        if c.is_whitespace() || c == '_' || c == '-' {
+            if !gap {
+                key.push('-');
+            }
+            gap = true;
+        } else {
+            key.push(c);
+            gap = false;
+        }
+    }
+    key
+}
+
 impl Project {
     pub fn new(name: String) -> Self {
         Self { name, sessions: Vec::new() }
@@ -490,6 +512,14 @@ const HOW: &str = r#"<h2>How it counts</h2>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_keys_match_the_websites() {
+        // The same cases as tests/counting.mjs, so both give the same answer.
+        for (name, key) in [("Vault Books", "vault-books"), ("vault-books", "vault-books"), ("vault_books", "vault-books"), ("  VAULT  books ", "vault-books"), ("vaultbooks", "vaultbooks"), ("ai_tracker", "ai-tracker"), ("-x--y_", "-x-y-")] {
+            assert_eq!(project_key(name), key, "{name}");
+        }
+    }
     use crate::analyze::analyze;
     use crate::model::{Event, EventKind, Session};
     use crate::prompt::PromptInfo;

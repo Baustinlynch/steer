@@ -53,5 +53,11 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     });
   } else if (m.type === "stop") {
     toApp({ kind: "stop", via: m.site, session });
+  } else if (m.type === "focus" && typeof m.on === "boolean") {
+    // The chat tab came to the front, or stopped being there.
+    toApp({ kind: "focus", via: m.site, session, on: m.on, at: Number.isFinite(m.at) ? m.at : undefined });
+  } else if (m.type === "copy" || m.type === "typing") {
+    // Copied something out of the chat, or started writing the next message. No text.
+    toApp({ kind: m.type, via: m.site, session });
   }
 });

@@ -4,6 +4,7 @@ mod codex;
 mod copilot;
 mod evidence;
 mod freebuff;
+mod idle;
 mod claude;
 mod git;
 mod live;
@@ -169,7 +170,10 @@ fn report(argv: &[String]) {
         if rep.turns.is_empty() {
             continue;
         }
-        by_name.entry(name.clone()).or_insert_with(|| report::Project::new(name)).sessions.push(rep);
+        // One project per key, named the way it was most recently (sessions go oldest first).
+        let project = by_name.entry(report::project_key(&name)).or_insert_with(|| report::Project::new(name.clone()));
+        project.name = name;
+        project.sessions.push(rep);
     }
 
     let mut projects: Vec<report::Project> = by_name.into_values().collect();

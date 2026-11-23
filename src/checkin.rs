@@ -95,12 +95,20 @@ pub struct Schedule {
     at: u64,
     done: bool,
     seed: u64,
+    /// When this watcher started. A block whose moment came before it isn't asked late,
+    /// or every restart (an update, a login) would ask right away, which isn't a random
+    /// moment, and could ask twice in a block.
+    started: u64,
 }
 
 impl Schedule {
     pub fn new() -> Self {
+        Self::starting_at(now())
+    }
+
+    fn starting_at(started: u64) -> Self {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
-        Self { block: 0, at: 0, done: true, seed: nanos ^ u64::from(std::process::id()) | 1 }
+        Self { block: 0, at: 0, done: true, seed: nanos ^ u64::from(std::process::id()) | 1, started }
     }
 
     fn random(&mut self) -> u64 {
@@ -119,7 +127,7 @@ impl Schedule {
             // Not in the block's last minute, or the watcher (which looks every few
             // seconds) could miss it and skip the block.
             self.at = start + self.random() % size.saturating_sub(60).max(1);
-            self.done = false;
+            self.done = self.at < self.started;
         }
         if !self.done && now >= self.at {
             self.done = true;
@@ -138,22 +146,32 @@ pub fn tick(schedule: &mut Schedule) {
         offer(now);
         return;
     }
-    if !schedule.due(now, block()) || !active(now, ACTIVE) || ASKING.swap(true, Ordering::SeqCst) {
+    if !schedule.due(now, block()) || !active(now, ACTIVE) || asked_in_block(now, block()) || ASKING.swap(true, Ordering::SeqCst) {
         return;
     }
+    // Kept in a file, so a watcher that restarts in this block doesn't ask again.
+    let _ = fs::write(last_asked_file(), now.to_string());
     std::thread::spawn(|| {
         ask_and_send();
         ASKING.store(false, Ordering::SeqCst);
     });
 }
 
-/// Whether an AI tool was used in the last `within` seconds. `enqueue` notes the time of
-/// every event except check-ins, so answering doesn't keep the questions going.
-fn active(now: u64, within: u64) -> bool {
-    fs::read_to_string(dir().join("last-activity"))
+fn last_asked_file() -> PathBuf {
+    dir().join("checkin-last")
+}
+
+/// Whether the question was already asked in the block `now` is in, by this watcher or
+/// one that ran before it.
+fn asked_in_block(now: u64, size: u64) -> bool {
+    fs::read_to_string(last_asked_file())
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .is_some_and(|t| now.saturating_sub(t) <= within)
+        .is_some_and(|t| t >= now / size * size)
+}
+
+fn active(now: u64, within: u64) -> bool {
+    live::active_within(now, within)
 }
 
 // ---------- asking once whether to turn check-ins on ----------
@@ -370,8 +388,40 @@ mod tests {
     }
 
     #[test]
+    fn a_watcher_that_starts_mid_block_doesnt_ask_late() {
+        // Started 10 minutes into a block: if that block's moment was before the start,
+        // it waits for the next block instead of asking right away.
+        let start = 20_000 * BLOCK;
+        let mut skipped = 0;
+        for _ in 0..50 {
+            let mut s = Schedule::starting_at(start + 600);
+            let mut asked = Vec::new();
+            for t in (start + 600..start + 2 * BLOCK).step_by(5) {
+                if s.due(t, BLOCK) {
+                    asked.push(t);
+                }
+            }
+            assert!(asked.iter().filter(|&&t| t >= start + BLOCK).count() == 1, "the next block is asked normally");
+            if asked.len() == 1 {
+                skipped += 1;
+            }
+        }
+        assert!(skipped > 0, "about half the time the first block's moment had already passed");
+    }
+
+    #[test]
+    fn asked_once_per_block_even_across_restarts() {
+        crate::live::use_temp_home();
+        fs::create_dir_all(dir()).unwrap();
+        let block_start = 30_000 * BLOCK;
+        fs::write(last_asked_file(), (block_start + 100).to_string()).unwrap();
+        assert!(asked_in_block(block_start + 500, BLOCK), "a new watcher in the same block doesn't ask again");
+        assert!(!asked_in_block(block_start + BLOCK + 1, BLOCK), "the next block can be asked");
+    }
+
+    #[test]
     fn asks_once_per_block_at_a_random_moment() {
-        let mut s = Schedule::new();
+        let mut s = Schedule::starting_at(0);
         let mut asked = Vec::new();
         for t in (10_000 * BLOCK..10_000 * BLOCK + 6 * BLOCK).step_by(5) {
             if s.due(t, BLOCK) {

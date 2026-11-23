@@ -4,7 +4,7 @@
 //   node tests/counting.mjs
 
 import assert from "node:assert/strict";
-import { accuracy, analyzePrompt, applyCaps, buildReport, checkinMoments, checks, gapCredit, projectHuman, projectOverlap, renderAccuracy, rulesFrom } from "../web/steer.js";
+import { accuracy, analyzePrompt, applyCaps, buildReport, checkinMoments, checks, gapCredit, projectHuman, projectKey, projectOverlap, renderAccuracy, rulesFrom } from "../web/steer.js";
 
 const T0 = Date.UTC(2026, 10, 20, 15, 0, 0);
 const sec = (s) => T0 + s * 1000;
@@ -234,6 +234,32 @@ assert.deepEqual(checks(reportOf([session("normal", honest())])), []);
   const nightNotes = checks(night).flatMap((d) => d.notes).join(" | ");
   assert.match(nightNotes, /counted in 24 hours/);
   assert.doesNotMatch(nightNotes, /counted in one day/, "each day alone is under 12h");
+}
+
+// One project whatever its folder is called on each computer.
+{
+  for (const [name, key] of [
+    ["Vault Books", "vault-books"],
+    ["vault-books", "vault-books"],
+    ["vault_books", "vault-books"],
+    ["  VAULT  books ", "vault-books"],
+    ["vaultbooks", "vaultbooks"],
+    ["ai_tracker", "ai-tracker"],
+    ["-x--y_", "-x-y-"],
+  ]) {
+    assert.equal(projectKey(name), key, name); // the same cases as project_key in src/report.rs
+  }
+  const handMade = session("a", [prompt(0, 200), agent(30), agent(60)], "Vault Books");
+  const cloned = session("b", [prompt(7200, 200), agent(7230), agent(7260)], "vault-books");
+  // A file saved in the hand-made folder's spelling, right after the clone's session.
+  const saved = { path: "evidence:Vault Books", cwd: "Vault Books", title: null, evidence: true, events: [{ id: "sv1", t: sec(7300), kind: "save", count: 2 }] };
+  const projects = buildReport([handMade, cloned, saved], { days: null, now: sec(10 * 86400) });
+  assert.equal(projects.length, 1, "one project");
+  assert.equal(projects[0].name, "vault-books", "named the way it was used last");
+  assert.equal(projects[0].sessions.length, 2, "the save joined a session instead of standing alone");
+  assert.ok(projects[0].sessions.some((x) => x.turns.some((t) => t.kind === "save")));
+  const apart = buildReport([handMade, session("c", [prompt(7200, 200), agent(7230)], "vaultbooks")], { days: null, now: sec(10 * 86400) });
+  assert.equal(apart.length, 2, "a different name is a different project");
 }
 
 // The accuracy page: each check-in answer against what each way of counting counted.

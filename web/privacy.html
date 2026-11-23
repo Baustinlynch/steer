@@ -16,7 +16,7 @@
 <ul>
 <li>The text of your prompts, and the AI's answers. steer reads a prompt to work out a few counts, like how many words it had, and then drops it.</li>
 <li>Your code, file names and file contents.</li>
-<li>Anything outside the AI tools and projects you use. steer doesn't look at your screen, other apps, your browsing or what you type anywhere else.</li>
+<li>Anything outside the AI tools and projects you use. steer doesn't look at your screen, other apps, your browsing or what you type anywhere else. The one thing it reads from the whole computer is how long since the keyboard or mouse was touched, listed below.</li>
 </ul>
 
 <h2>What gets sent</h2>
@@ -24,9 +24,17 @@
 <p><code>id, session, project, via (which tool), time, words, chars, images, specific, observation, generic, repeat</code></p>
 <p>The last four are counts and yes/no flags worked out from the prompt on your computer, like how many file names or error messages it mentioned. When you change code or commit in a repo you used AI in, steer sends <code>project, time, count of files changed</code> or <code>project, time, commit hash</code>. The project is the name of the git repo or folder you were in. Each batch also says what time your computer thinks it is, so a wrong clock can be corrected.</p>
 <p>If you turn on check-ins, each answer sends which of the three buttons you picked and when.</p>
+<p>steer also collects a few signs of what you're doing, so it can count your time from what you actually do instead of guessing from gaps. They don't count toward anything yet:</p>
+<ul>
+<li><code>wait</code>: Claude Code showed you a permission prompt. Only that it did, nothing about the tool or the command.</li>
+<li><code>focus</code>: a ChatGPT or Claude tab came to the front, or stopped being there.</li>
+<li><code>copy</code> and <code>typing</code>: you copied something out of a ChatGPT or Claude tab, or started typing your next message there. Never the text.</li>
+<li><code>away</code>, <code>back</code> and <code>here</code>: from your computer's idle timer, only within an hour of using an AI tool. Away when nobody touched the keyboard or mouse for 2 minutes, back when someone does again (with how long they were gone), and here every 5 minutes while someone's there. The idle timer is one number of seconds. It has no app names and nothing about what you typed.</li>
+</ul>
+<p>Prompts also say which permission mode Claude Code or Codex was in (like "default" or "never"), and tool events say how long the tool ran.</p>
 
 <h2>The browser extension</h2>
-<p>The steer extension only runs on chatgpt.com and claude.ai. When you send a message there, it counts the message inside your browser, the same way the app counts a prompt, and notices when the answer is done. It hands only those counts to the steer app on your computer, which sends them like any other event, with via <code>chatgpt</code> or <code>claude-ai</code>. The message text and the answers stay in your browser. The extension doesn't send anything to any server itself, and the only permission it asks Chrome for is talking to the steer app on your computer.</p>
+<p>The steer extension only runs on chatgpt.com and claude.ai. When you send a message there, it counts the message inside your browser, the same way the app counts a prompt, and notices when the answer is done. It also notices when the tab comes to the front or leaves it, copying, and when you start typing a message, as above. It hands only those counts to the steer app on your computer, which sends them like any other event, with via <code>chatgpt</code> or <code>claude-ai</code>. The message text and the answers stay in your browser. The extension doesn't send anything to any server itself, and the only permission it asks Chrome for is talking to the steer app on your computer.</p>
 
 <h2>What steer keeps</h2>
 <ul>

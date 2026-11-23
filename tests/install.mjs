@@ -121,6 +121,8 @@ try {
   assert.ok(existsSync(bin), "steer was copied into ~/.steer/bin");
   const settings = JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8"));
   assert.ok(settings.hooks.UserPromptSubmit[0].hooks[0].command.includes(join(".steer", "bin")));
+  assert.deepEqual(Object.keys(settings.hooks).sort(), ["PermissionRequest", "PostToolUse", "PostToolUseFailure", "Stop", "UserPromptSubmit"]);
+  assert.equal(settings.hooks.PermissionRequest[0].matcher, "*");
   assert.match(await steer(bin, []), /account: ci/, "plain steer shows the status once it's set up");
   if (!windows) {
     const host = JSON.parse(readFileSync(hostManifest, "utf8"));
@@ -179,6 +181,27 @@ try {
   assert.equal(s2Prompts().length, 1, "only the typed prompt is sent");
   assert.ok(!readFileSync(eventsFile, "utf8").includes(log), "the log's path never leaves the computer");
 
+  // A permission prompt, a tool that ran 1.2 seconds, and one the person stopped. What
+  // reaches the server says when, and nothing about the command.
+  const hookIn = (o) => JSON.stringify({ session_id: "s3", cwd: join(home, "proj"), permission_mode: "default", ...o });
+  await steer(bin, ["hook"], { input: hookIn({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "rm -rf secret-folder" } }) });
+  await steer(bin, ["hook"], { input: hookIn({ hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "rm -rf secret-folder" }, tool_response: {}, duration_ms: 1200 }) });
+  await steer(bin, ["hook"], { input: hookIn({ hook_event_name: "PostToolUseFailure", tool_name: "Bash", tool_input: {}, error: "stopped", is_interrupt: true }) });
+  const s3 = () => readFileSync(eventsFile, "utf8").split("\n").filter((l) => l.includes('"session":"s3"')).map((l) => JSON.parse(l));
+  await until("the hook events to reach the server", async () => {
+    await steer(bin, ["flush"], { allowFail: true });
+    return s3().length >= 3;
+  });
+  assert.deepEqual(
+    s3().map((e) => [e.kind, e.reason ?? e.ms ?? null]),
+    [
+      ["wait", "permission"],
+      ["tool", 1200],
+      ["interrupt", null],
+    ],
+  );
+  assert.ok(!readFileSync(eventsFile, "utf8").includes("secret-folder"), "the command never leaves the computer");
+
   // A prompt on ChatGPT, through the browser extension. Chrome starts steer with the
   // extension's origin and they talk in messages of a 4-byte length and then JSON.
   async function fromBrowser(message) {
@@ -236,7 +259,7 @@ try {
   else spawnSync("kill", [pid]);
   watcher.kill();
   const removed = await steer(bin, ["uninstall", "--yes"]);
-  assert.match(removed, /took 3 steer hooks out/);
+  assert.match(removed, /took 5 steer hooks out/);
   if (!windows) assert.ok(!existsSync(hostManifest), "chrome can't start steer anymore");
   const after = JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8"));
   assert.equal(after.hooks, undefined, "no steer hooks left in claude code settings");

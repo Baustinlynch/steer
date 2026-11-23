@@ -37,6 +37,8 @@ for (const file of readdirSync(dir).filter((f) => f.endsWith(".jsonl"))) {
     }
     if (e.late) continue;
     const t = Date.parse(e.t);
+    // Signs of attention aren't part of the counting yet.
+    if (["wait", "focus", "copy", "typing", "away", "back", "here"].includes(e.kind)) continue;
     if (e.kind === "checkin") {
       checkins.push({ t, answer: e.answer });
       continue;

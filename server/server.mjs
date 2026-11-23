@@ -25,6 +25,7 @@ import {
   projectAgent,
   projectBetween,
   projectHuman,
+  projectKey,
   renderAccuracy,
   renderReport,
   renderReview,
@@ -201,7 +202,7 @@ function note(store, e) {
 
 const NAME = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const clean = (s, max) => (typeof s === "string" ? s.replace(/[\u0000-\u001f]/g, "").slice(0, max) : "");
-const KINDS = new Set(["prompt", "tool", "stop", "interrupt", "checkin", "run", "save", "commit"]);
+const KINDS = new Set(["prompt", "tool", "stop", "interrupt", "checkin", "run", "save", "commit", "wait", "focus", "copy", "typing", "away", "back", "here"]);
 // Evidence from the project, sent by steer's watcher and terminal lines: a command you ran
 // (its first word and exit code), that files were saved, a commit's hash.
 const EVIDENCE = new Set(["run", "save", "commit"]);
@@ -211,7 +212,24 @@ const VIAS = new Set(["claude-code", "cursor", "codex", "opencode", "copilot", "
 // Check-ins (`steer checkin on`): the person's answer to "what are you doing right now?",
 // used to fit the credit curve. They come from steer itself and never count as time.
 const ANSWERS = new Set(["project-ai", "project", "other", "none"]);
-const INTERRUPTS = new Set(["codex", "copilot"]);
+// Claude Code sends interrupts from its tool hooks (a tool the person stopped).
+const INTERRUPTS = new Set(["codex", "copilot", "claude-code"]);
+// Signs of attention, collected so time can be counted from what the person does
+// instead of from gaps. Not counted yet:
+// - "wait": the agent is waiting on the person (a permission prompt showed)
+// - "focus" (on or off), "copy", "typing": a ChatGPT or Claude tab came to the front or
+//   left it, something was copied out of it, writing the next message started
+// - "away", "back", "here": from the computer's idle timer. Nobody touched the keyboard
+//   or mouse for 2 minutes, someone did again (with how long they were gone), and every
+//   5 minutes while someone's there, so a stretch with none of these is unknown
+const ATTENTION = new Set(["wait", "focus", "copy", "typing", "away", "back", "here"]);
+const WAITS = { via: new Set(["claude-code", "codex", "cursor"]), reasons: new Set(["permission", "question"]) };
+const CHATS = new Set(["chatgpt", "claude-ai"]);
+// Sent by steer itself rather than an AI tool.
+const FROM_STEER = new Set(["checkin", "run", "save", "commit", "away", "back", "here"]);
+// Permission settings a prompt can carry: Claude Code's modes and Codex's approval
+// policies. Says whether the agent could stop to ask the person at all.
+const MODES = new Set(["default", "plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "never", "on-request", "on-failure", "untrusted"]);
 const TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 const LONGEST = 256; // strings longer than this didn't come from steer
 // Upper bounds for prompt counts. Anything over these is made up.
@@ -230,7 +248,10 @@ function accept(raw, now) {
   const via = raw.via ?? "claude-code";
   if (!VIAS.has(via)) return null;
   if (kind === "interrupt" && !INTERRUPTS.has(via)) return null;
-  if ((kind === "checkin" || EVIDENCE.has(kind)) !== (via === "steer")) return null;
+  if (FROM_STEER.has(kind) !== (via === "steer")) return null;
+  if (kind === "wait" && (!WAITS.via.has(via) || !WAITS.reasons.has(raw.reason))) return null;
+  if ((kind === "focus" || kind === "copy" || kind === "typing") && !CHATS.has(via)) return null;
+  if (kind === "focus" && typeof raw.on !== "boolean") return null;
   if (kind === "checkin" && !ANSWERS.has(raw.answer)) return null;
   const t = typeof raw.t === "string" && TIME.test(raw.t) ? Date.parse(raw.t) : NaN;
   if (Number.isNaN(t)) return null;
@@ -265,8 +286,19 @@ function accept(raw, now) {
     e.observation = raw.observation === true;
     e.generic = raw.generic === true;
     e.repeat = raw.repeat === true;
+    if (raw.mode != null) {
+      if (!MODES.has(raw.mode)) return null;
+      e.mode = raw.mode;
+    }
   }
-  if (kind === "tool") e.tool = clean(raw.tool, 80);
+  if (kind === "tool") {
+    e.tool = clean(raw.tool, 80);
+    // How long it ran, so its start is known.
+    if (raw.ms != null) {
+      if (!Number.isInteger(raw.ms) || raw.ms < 0 || raw.ms > 86_400_000) return null;
+      e.ms = raw.ms;
+    }
+  }
   if (kind === "run") {
     if (typeof raw.name !== "string" || !/^[A-Za-z0-9._+-]{1,40}$/.test(raw.name)) return null;
     if (raw.exit != null && (!Number.isInteger(raw.exit) || raw.exit < -1 || raw.exit > 255)) return null;
@@ -284,6 +316,13 @@ function accept(raw, now) {
     if (typeof raw.hash !== "string" || !/^[0-9a-f]{7,40}$/.test(raw.hash)) return null;
     e.hash = raw.hash;
   }
+  if (kind === "wait") e.reason = raw.reason;
+  if (kind === "focus") e.on = raw.on;
+  if (kind === "back") {
+    const secs = raw.away_secs;
+    if (secs != null && (!Number.isInteger(secs) || secs < 0 || secs > 7 * 86400)) return null;
+    e.away_secs = secs ?? null;
+  }
   if (kind === "checkin") {
     e.answer = raw.answer;
     const waited = raw.answered_after;
@@ -297,7 +336,7 @@ function accept(raw, now) {
 async function sessionsOf(name) {
   const bySession = new Map();
   await eachEvent(name, (e) => {
-    if (e.late || e.kind === "checkin") return;
+    if (e.late || e.kind === "checkin" || ATTENTION.has(e.kind)) return;
     // Evidence goes in one session per project; web/steer.js merges it into the AI
     // session it belongs to.
     const evidence = EVIDENCE.has(e.kind);
@@ -509,12 +548,14 @@ function workerMain() {
       });
       return answers.length ? checkinMoments(projects, await sessionsOf(name), answers) : [];
     }
+    // Found by key, so the same project under another folder name is found too.
+    const named = (x) => projectKey(x.name) === projectKey(project);
     if (op === "commits") {
-      const whole = projects.find((x) => x.name === project);
+      const whole = projects.find(named);
       return whole ? reviewFacts(projectBetween(whole, from, to)).commits : [];
     }
     if (op === "review") {
-      const whole = projects.find((x) => x.name === project);
+      const whole = projects.find(named);
       if (!whole) return null;
       const p = projectBetween(whole, from, to);
       if (!p.sessions.length) return { empty: true };
@@ -532,7 +573,7 @@ function workerMain() {
       if (shown < p.sessions.length) {
         html = html.replace("<h2>Sessions</h2>\n", `<h2>Sessions</h2>\n<p class="muted">Showing the newest ${shown} of ${p.sessions.length} sessions. The hours above count all of them, and every event is in the download below.</p>\n`);
       }
-      return { html, secs: f.you, agent: f.agent, first: f.first, last: f.last, hours: hoursOf(f.you), line: `${hoursOf(f.you)}h tracked with steer, review: ${info.url}` };
+      return { name: whole.name, html, secs: f.you, agent: f.agent, first: f.first, last: f.last, hours: hoursOf(f.you), line: `${hoursOf(f.you)}h tracked with steer, review: ${info.url}` };
     }
     if (op === "report") {
       return {
@@ -555,7 +596,7 @@ function workerMain() {
         })),
       };
     }
-    const p = projects.find((x) => x.name === project);
+    const p = projects.find(named);
     return p ? projectHtml(p) : null;
   }
 }
@@ -822,9 +863,19 @@ async function profilePage(res, name) {
 async function projectPage(res, name, project) {
   const store = await storeOf(name);
   const report = await reportOf(name, store);
-  const html = report.hours.some((p) => p.name === project) ? await projectOf(name, store, project) : null;
+  const found = report.hours.find((p) => projectKey(p.name) === projectKey(project));
+  if (!found) return send(res, 404, "No such project");
+  // The same project under another spelling (an old link, another computer's folder
+  // name): send it to the one page. Not a permanent redirect, since the name shown is
+  // whichever was used last and can change back.
+  if (found.name !== project) {
+    res.writeHead(302, { location: `/u/${encodeURIComponent(name)}/${encodeURIComponent(found.name)}` });
+    return res.end();
+  }
+  const html = await projectOf(name, store, project);
   if (html == null) return send(res, 404, "No such project");
-  const tools = [...(store.vias.get(project) ?? [])];
+  const key = projectKey(project);
+  const tools = [...new Set([...store.vias].filter(([p]) => projectKey(p) === key).flatMap(([, vias]) => [...vias]))];
   const u = encodeURIComponent(name);
   const pr = encodeURIComponent(project);
   const badgeLine = `[![steered with ai](${PUBLIC_URL}/badge/${u}/${pr}.svg)](${PUBLIC_URL}/u/${u}/${pr})`;
@@ -861,7 +912,8 @@ async function badge(res, name, project) {
   try {
     if (name !== null && project !== null && hasUser(name)) {
       const hours = (await reportOf(name, await storeOf(name))).hours;
-      const secs = project === undefined ? hours.reduce((n, p) => n + p.your_secs, 0) : hours.find((p) => p.name === project)?.your_secs;
+      const secs =
+        project === undefined ? hours.reduce((n, p) => n + p.your_secs, 0) : hours.find((p) => projectKey(p.name) === projectKey(project))?.your_secs;
       if (secs != null) value = fmtDur(secs);
     }
   } catch {
@@ -875,7 +927,7 @@ async function badge(res, name, project) {
 
 async function hoursJson(res, name, project) {
   const store = await storeOf(name);
-  const projects = (await reportOf(name, store)).hours.filter((p) => !project || p.name === project);
+  const projects = (await reportOf(name, store)).hours.filter((p) => !project || projectKey(p.name) === projectKey(project));
   if (project && !projects.length) return json(res, 404, { error: "no such project" });
   const hc = users[name].hc;
   json(res, 200, {
@@ -929,7 +981,7 @@ async function submitReview(req, res) {
   const review = {
     id,
     user: name,
-    project,
+    project: r.name ?? project,
     from,
     to,
     first: r.first,
@@ -948,7 +1000,7 @@ async function submitReview(req, res) {
   };
   mkdirSync(REVIEWS, { recursive: true });
   writeFileSync(reviewFile(id), JSON.stringify(review), { flag: "wx" });
-  users[name].reviews = [...(users[name].reviews ?? []), { id, project, hours: r.hours, frozen }].slice(-500);
+  users[name].reviews = [...(users[name].reviews ?? []), { id, project: review.project, hours: r.hours, frozen }].slice(-500);
   saveUsers();
   json(res, 201, { id, url, hours: r.hours, your_time: fmtDur(r.secs), line: r.line });
 }
@@ -1190,7 +1242,7 @@ async function eventsJsonl(req, res, name, { project = null, lo = -Infinity, hi 
           } catch {
             continue;
           }
-          if (project !== null && e.project !== project) continue;
+          if (project !== null && projectKey(e.project) !== projectKey(project)) continue;
           const t = Date.parse(e.t);
           if (t < lo || t >= hi) continue;
           out += line + "\n";

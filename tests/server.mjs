@@ -147,10 +147,8 @@ try {
     ev({ via: "vim" }),
     ev({ via: "" }),
     ev({ kind: "hack" }),
-    ev({ kind: "interrupt", via: "claude-code" }),
     ev({ kind: "interrupt", via: "cursor" }),
     ev({ kind: "interrupt", via: "opencode" }),
-    ev({ kind: "interrupt", via: undefined }),
     // Check-ins only come from steer, with one of the known answers.
     ev({ kind: "checkin", via: "claude-code", answer: "project" }),
     ev({ kind: "checkin", via: "steer", answer: "maybe" }),
@@ -189,6 +187,9 @@ try {
     ev({ kind: "run", via: "steer", name: "npm", exit: 1, secs: 12 }),
     ev({ kind: "save", via: "steer", count: 3 }),
     ev({ kind: "commit", via: "steer", hash: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0" }),
+    // Claude Code sends an interrupt when the person stops a running tool.
+    ev({ kind: "interrupt", via: "claude-code" }),
+    ev({ kind: "interrupt", via: undefined }),
   ];
   const mixed = await post(alice, { events: [...bad, ...good] });
   assert.equal(mixed.status, 200);
@@ -392,6 +393,73 @@ try {
     assert.equal((await get(path)).text, view.text, "frozen");
     assert.equal((await get("/r/short")).status, 404);
     assert.equal((await get("/r/../users.json")).status, 404);
+  }
+
+  // One project whatever its folder is called on each computer.
+  {
+    const key = (await signup("vaulter", "10.0.0.32")).body.key;
+    const at = (mins) => iso(Date.now() - mins * 60_000);
+    const sent = await post(key, {
+      events: [
+        prompt({ session: "hand", project: "Vault Books", t: at(10) }),
+        ev({ session: "hand", project: "Vault Books", t: at(9.5) }),
+        ev({ kind: "stop", tool: undefined, session: "hand", project: "Vault Books", t: at(9) }),
+        prompt({ session: "clone", project: "vault-books", t: at(4) }),
+        ev({ session: "clone", project: "vault-books", via: "codex", t: at(3.5) }),
+        ev({ kind: "stop", tool: undefined, session: "clone", project: "vault-books", via: "codex", t: at(3) }),
+      ],
+    });
+    assert.equal(sent.body.accepted, 6);
+    const hours = JSON.parse((await get("/api/u/vaulter")).text);
+    assert.deepEqual(hours.projects.map((p) => p.name), ["vault-books"], "one project, named the way it was used last");
+    const old = await fetch(`${STEER}/u/vaulter/${encodeURIComponent("Vault Books")}`, { redirect: "manual" });
+    assert.equal(old.status, 302, "the other spelling goes to the one page");
+    assert.equal(old.headers.get("location"), "/u/vaulter/vault-books");
+    const page = await get("/u/vaulter/vault-books");
+    assert.equal(page.status, 200);
+    assert.match(page.text, /Tracked from claude-code, codex/, "tools from both folders");
+    assert.doesNotMatch((await get(`/badge/vaulter/${encodeURIComponent("Vault Books")}.svg`)).text, /not found/, "old badge links keep working");
+    const exported = (await get(`/api/u/vaulter/events?project=${encodeURIComponent("vault-books")}`)).text.trim().split("\n");
+    assert.equal(exported.length, 6, "a project's events include both spellings");
+  }
+
+  // Signs of attention: kept and checked, not counted yet.
+  {
+    const key = (await signup("watcher", "10.0.0.31")).body.key;
+    const fromSteer = (kind, o = {}) => ({ id: `id-${n++}`, session: "presence", project: "presence", via: "steer", kind, t: iso(Date.now()), ...o });
+    const chat = (kind, o = {}) => ev({ kind, tool: undefined, via: "chatgpt", session: "chat1", ...o });
+    const good = [
+      ev({ kind: "wait", tool: undefined, reason: "permission" }),
+      ev({ tool: "Bash", ms: 1234 }),
+      ev({ kind: "interrupt", tool: undefined }),
+      prompt({ mode: "acceptEdits" }),
+      prompt({ via: "codex", mode: "on-request" }),
+      chat("focus", { on: true }),
+      chat("focus", { on: false }),
+      chat("copy"),
+      chat("typing"),
+      fromSteer("away"),
+      fromSteer("back", { away_secs: 910 }),
+      fromSteer("here"),
+    ];
+    const bad = [
+      ev({ kind: "wait", tool: undefined, reason: "Claude needs your permission to use Bash" }), // never the message
+      ev({ kind: "wait", tool: undefined, via: "chatgpt", reason: "permission" }),
+      ev({ tool: "Bash", ms: -5 }),
+      prompt({ mode: "yolo" }),
+      chat("focus", { on: "yes" }),
+      chat("copy", { via: "claude-code" }), // only from the browser extension
+      fromSteer("back", { away_secs: 30 * 86400 }),
+      { ...fromSteer("here"), via: "claude-code" }, // only from steer itself
+    ];
+    const r = await post(key, { events: [...good, ...bad] });
+    assert.equal(r.body.accepted, good.length);
+    assert.equal(r.body.dropped, bad.length);
+    const stored = (await get("/api/u/watcher/events")).text;
+    for (const part of ['"reason":"permission"', '"ms":1234', '"mode":"acceptEdits"', '"mode":"on-request"', '"on":true', '"away_secs":910', '"kind":"here"']) {
+      assert.ok(stored.includes(part), `kept ${part}`);
+    }
+    assert.ok(!(await get("/u/watcher")).text.includes(">presence<"), "they don't make a project or count as time");
   }
 
   // The accuracy page adds up everyone's check-in answers, without names.

@@ -30,28 +30,33 @@ function fakePage(origin, serve) {
   const box = { innerText: "", images: 0 };
   const area = { querySelectorAll: () => ({ length: box.images }) };
   box.closest = () => area;
-  const windowListeners = [];
+  const windowListeners = {};
   const documentListeners = {};
   const window = {
     location: new URL(origin),
     fetch: async (input, init) => serve(input, init),
     postMessage(data, target) {
       assert.equal(target, origin);
-      for (const l of windowListeners) l({ source: window, origin, data });
+      for (const l of windowListeners.message ?? []) l({ source: window, origin, data });
     },
-    addEventListener: (type, fn) => type === "message" && windowListeners.push(fn),
+    addEventListener: (type, fn) => (windowListeners[type] ??= []).push(fn),
   };
   // ChatGPT leaves a hidden stop button in the page after the answer, which doesn't count.
   const hiddenStop = { getClientRects: () => [] };
   const shownStop = { getClientRects: () => [{}] };
   const document = {
     documentElement: {},
+    visibilityState: "visible",
+    focused: true,
+    hasFocus() {
+      return this.focused;
+    },
     addEventListener: (type, fn) => (documentListeners[type] ??= []).push(fn),
     querySelector: (sel) => (sel === CLAUDE_BOX ? box : null),
     querySelectorAll: (sel) => (sel.includes("stop") ? (stopButton ? [hiddenStop, shownStop] : [hiddenStop]) : []),
   };
   const chrome = { runtime: { sendMessage: (m) => (toWorker.push(m), Promise.resolve()) } };
-  const ctx = vm.createContext({ window, document, chrome, location: window.location, URL, Request, setTimeout, Date, Math, JSON, String, Number, Array, Promise });
+  const ctx = vm.createContext({ window, document, chrome, location: window.location, URL, Request, setTimeout, clearTimeout, Date, Math, JSON, String, Number, Array, Promise });
   vm.runInContext(read("page.js"), ctx);
   vm.runInContext(read("bridge.js"), ctx);
   const inBox = { closest: (sel) => (sel === CLAUDE_BOX ? box : null) };
@@ -62,6 +67,9 @@ function fakePage(origin, serve) {
     setWriting: (on) => (stopButton = on),
     type: (text, images = 0) => Object.assign(box, { innerText: text, images }),
     pressEnter: (shiftKey = false) => documentListeners.keydown.forEach((fn) => fn({ key: "Enter", shiftKey, isComposing: false, target: inBox })),
+    fire: (type, target = {}, key = "a") => (documentListeners[type] ?? []).forEach((fn) => fn({ key, target })),
+    fireWindow: (type) => (windowListeners[type] ?? []).forEach((fn) => fn({})),
+    document,
   };
 }
 
@@ -162,6 +170,76 @@ const chatgptBody = (text) =>
   assert.equal(page.toWorker[0].text, "continue");
 }
 
+// Whether the chat is in front, sent each time that changes and lasts a second, stamped
+// with when it changed.
+{
+  const page = fakePage("https://chatgpt.com", () => streamed(10));
+  const step = async (change) => {
+    change();
+    await sleep(1100);
+  };
+  const loaded = Date.now();
+  await step(() => page.fire("DOMContentLoaded")); // loaded in front
+  await step(() => {
+    page.document.focused = false; // another app came to the front
+    page.fireWindow("blur");
+  });
+  // Alt-tabbing past it: back in front for a moment and gone again. Nothing sent.
+  page.document.focused = true;
+  page.fireWindow("focus");
+  await sleep(200);
+  page.document.focused = false;
+  page.fireWindow("blur");
+  await sleep(1100);
+  await step(() => {
+    page.document.focused = true;
+    page.fireWindow("focus");
+  });
+  page.fireWindow("focus"); // nothing changed
+  await step(() => {
+    page.document.visibilityState = "hidden"; // another tab
+    page.fire("visibilitychange");
+  });
+  page.document.visibilityState = "visible";
+  page.fire("visibilitychange");
+  page.fireWindow("pagehide"); // closed right away: sent at once
+  assert.deepEqual(
+    page.toWorker.map((m) => [m.type, m.on]),
+    [
+      ["focus", true],
+      ["focus", false],
+      ["focus", true],
+      ["focus", false],
+    ],
+  );
+  assert.ok(Math.abs(page.toWorker[0].at - loaded) < 100, "stamped when it changed, not a second later");
+  assert.ok(page.toWorker.every((m) => m.session === page.toWorker[0].session && m.text === ""));
+}
+
+// Copying out of the chat, and when writing each message started.
+{
+  const page = fakePage("https://chatgpt.com", () => streamed(10));
+  const box = { closest: (sel) => (sel.includes("textarea") ? {} : null) };
+  page.fire("copy");
+  page.fire("copy"); // within 5 seconds
+  page.fire("keydown", box, "Enter"); // not a typed character
+  page.fire("keydown", box, "t");
+  page.fire("keydown", box, "h"); // still the same message
+  page.fire("keydown", { closest: () => null }, "x"); // typing somewhere else on the page
+  await page.window.fetch("https://chatgpt.com/backend-api/f/conversation", { method: "POST", body: chatgptBody("the jump is floaty") });
+  page.fire("keydown", box, "n"); // the next message
+  assert.deepEqual(page.types(), ["copy", "typing", "prompt", "typing"]);
+  // A tab in the background doesn't count a copy.
+  const hidden = fakePage("https://claude.ai", () => streamed(10));
+  hidden.document.visibilityState = "hidden";
+  hidden.fire("copy");
+  assert.equal(hidden.toWorker.length, 0);
+  // The page can't make up other kinds, or a focus that's neither on nor off.
+  page.window.postMessage({ steer: 1, site: "chatgpt", type: "keys" }, "https://chatgpt.com");
+  page.window.postMessage({ steer: 1, site: "chatgpt", type: "focus", on: "yes" }, "https://chatgpt.com");
+  assert.equal(page.toWorker.length, 4);
+}
+
 // Other sites' messages don't get through the bridge.
 {
   const page = fakePage("https://chatgpt.com", () => streamed(10));
@@ -196,6 +274,16 @@ const chatgptBody = (text) =>
   onMessage({ type: "prompt", site: "chatgpt", session: "../../x", text: "hi", images: 0 }, from, () => {});
   onMessage({ type: "prompt", site: "chatgpt", session, text: "secret" }, { id: "someone-else", tab: { id: 7 } }, () => {});
   assert.equal(toApp.length, 4, "messages from other extensions are ignored");
+  onMessage({ type: "focus", site: "chatgpt", session, on: true, at: 1234 }, from, () => {});
+  onMessage({ type: "copy", site: "chatgpt", session }, from, () => {});
+  onMessage({ type: "typing", site: "chatgpt", session }, from, () => {});
+  onMessage({ type: "focus", site: "chatgpt", session, on: 1 }, from, () => {});
+  onMessage({ type: "keys", site: "chatgpt", session }, from, () => {});
+  assert.deepEqual(toApp.slice(4), [
+    { kind: "focus", via: "chatgpt", session, on: true, at: 1234 },
+    { kind: "copy", via: "chatgpt", session },
+    { kind: "typing", via: "chatgpt", session },
+  ]);
   assert.equal(toApp[0].kind, "prompt");
   assert.equal(toApp[0].via, "chatgpt");
   assert.ok(toApp[0].words >= 10 && toApp[0].specific >= 1 && toApp[0].observation === true);

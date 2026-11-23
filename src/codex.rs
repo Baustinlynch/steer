@@ -11,6 +11,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 pub const VIA: &str = "codex";
+/// Codex's approval policies: when it stops to ask before running something.
+const POLICIES: [&str; 4] = ["never", "on-request", "on-failure", "untrusted"];
 
 fn root() -> PathBuf {
     std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".codex")).join("sessions")
@@ -28,15 +30,29 @@ pub fn poll(state: &mut Map<String, Value>, skip_existing: bool) -> Vec<Value> {
             let (session, cwd) = read_meta(path).unwrap_or_else(|| (stem(path), String::new()));
             (session, project_name(&cwd))
         },
-        |v, ctx, line_offset| {
-            if v.get("type").and_then(Value::as_str) == Some("turn_context") {
-                if let Some(cwd) = v.pointer("/payload/cwd").and_then(Value::as_str) {
-                    ctx.project = project_name(cwd);
-                }
-            }
-            parse(v, &ctx.session, &ctx.project, line_offset)
-        },
+        read_record,
     )
+}
+
+/// One record of a session file: notes the folder and approval policy from each turn's
+/// context, and turns the rest into events.
+fn read_record(v: &Value, ctx: &mut tail::Ctx, line_offset: u64) -> Option<Value> {
+    if v.get("type").and_then(Value::as_str) == Some("turn_context") {
+        if let Some(cwd) = v.pointer("/payload/cwd").and_then(Value::as_str) {
+            ctx.project = project_name(cwd);
+        }
+        if let Some(policy) = v.pointer("/payload/approval_policy").and_then(Value::as_str).filter(|p| POLICIES.contains(p)) {
+            ctx.mode = Some(policy.to_owned());
+        }
+    }
+    let mut e = parse(v, &ctx.session, &ctx.project, line_offset)?;
+    // Whether Codex could stop to ask the person, so the counting knows.
+    if e["kind"] == "prompt" {
+        if let Some(mode) = &ctx.mode {
+            e["mode"] = mode.as_str().into();
+        }
+    }
+    Some(e)
 }
 
 fn stem(path: &Path) -> String {
@@ -121,6 +137,24 @@ mod tests {
 
     fn rec(kind: &str, payload: Value) -> Value {
         json!({ "timestamp": "2026-11-14T23:16:51.123Z", "ordinal": 7, "type": kind, "payload": payload })
+    }
+
+    #[test]
+    fn prompts_carry_the_approval_policy() {
+        crate::live::use_temp_home();
+        let mut ctx = tail::Ctx { session: "s".into(), project: "unknown".into(), mode: None };
+        let context = rec("turn_context", json!({ "cwd": "/tmp/steer-codex-test", "approval_policy": "on-request" }));
+        assert!(read_record(&context, &mut ctx, 0).is_none());
+        assert_eq!(ctx.mode.as_deref(), Some("on-request"));
+        let typed = rec("response_item", json!({
+            "type": "message", "role": "user",
+            "content": [{ "type": "input_text", "text": "why does the build fail on windows" }],
+            "internal_chat_message_metadata_passthrough": { "content_item_kinds": ["user.text"] }
+        }));
+        assert_eq!(read_record(&typed, &mut ctx, 1).unwrap()["mode"], "on-request");
+        let odd = rec("turn_context", json!({ "approval_policy": "whatever" }));
+        read_record(&odd, &mut ctx, 2);
+        assert_eq!(ctx.mode.as_deref(), Some("on-request"), "unknown policies are ignored");
     }
 
     #[test]

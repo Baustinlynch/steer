@@ -6,7 +6,7 @@ use crate::prompt::PromptInfo;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub fn default_root() -> Option<PathBuf> {
@@ -30,6 +30,30 @@ pub fn find_session_files(root: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// The Claude Code version that wrote the newest session log, like (2, 1, 330). Every
+/// entry in a log says which version wrote it.
+pub fn newest_version(root: &Path) -> Option<(u32, u32, u32)> {
+    let newest = find_session_files(root)
+        .into_iter()
+        .filter_map(|p| Some((fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .max_by_key(|(t, _)| *t)?
+        .1;
+    let mut file = File::open(newest).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024))).ok()?;
+    let mut buf = Vec::new();
+    file.take(256 * 1024).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let at = text.rfind("\"version\":\"")? + "\"version\":\"".len();
+    parse_version(text[at..].split('"').next()?)
+}
+
+/// "2.1.330" as (2, 1, 330).
+pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.trim().split('.').map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
 }
 
 pub fn parse_session(path: &Path) -> Option<Session> {

@@ -76,6 +76,12 @@ pub fn run() -> i32 {
     let installed = std::env::current_exe().ok().and_then(|e| fs::canonicalize(e).ok()) == fs::canonicalize(live::bin_path()).ok();
     let mut checkins = crate::checkin::Schedule::new();
     let mut evidence = crate::evidence::Watch::default();
+    let mut presence = crate::idle::Presence::default();
+    if installed {
+        if let Some(msg) = live::refresh_hooks() {
+            eprintln!("steer: {msg}");
+        }
+    }
 
     loop {
         if installed && crate::manage::update_due() {
@@ -114,6 +120,7 @@ pub fn run() -> i32 {
         skip_copilot = false;
         skip_freebuff = false;
         events.extend(crate::evidence::poll(&mut evidence));
+        events.extend(crate::idle::poll(&mut presence, now_secs()));
 
         let _ = enqueue(&events);
         let _ = fs::write(state_path(), Value::Object(state.clone()).to_string());
@@ -304,4 +311,8 @@ pub fn autostart(remove: bool) -> Result<String, String> {
     } else {
         Ok("couldn't set the watcher to start at login on this system, run steer watch yourself".into())
     }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }

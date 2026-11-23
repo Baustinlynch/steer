@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "steer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tracks the time you spend coding with ChatGPT and Claude in the browser, for steer. Prompt text never leaves your computer.",
   "icons": {
     "16": "icons/16.png",

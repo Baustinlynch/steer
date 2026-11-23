@@ -14,6 +14,9 @@ const MAX_READ: u64 = 32 * 1024 * 1024;
 pub struct Ctx {
     pub session: String,
     pub project: String,
+    /// The tool's permission setting for this session, if its log says (Codex's
+    /// approval_policy). Kept with the file's state like the project.
+    pub mode: Option<String>,
 }
 
 /// Every .jsonl file under `dir`, at any depth.
@@ -62,6 +65,7 @@ pub fn poll(
         let mut ctx = Ctx {
             session: entry["session"].as_str().unwrap_or_default().to_owned(),
             project: entry["project"].as_str().unwrap_or("unknown").to_owned(),
+            mode: entry["mode"].as_str().map(str::to_owned),
         };
 
         let Ok(mut file) = File::open(&path) else { continue };
@@ -85,6 +89,9 @@ pub fn poll(
         }
         entry["offset"] = (offset + end as u64 + 1).into();
         entry["project"] = ctx.project.into();
+        if let Some(mode) = ctx.mode {
+            entry["mode"] = mode.into();
+        }
     }
     state.retain(|k, _| Path::new(k).exists());
     out
