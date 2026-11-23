@@ -16,7 +16,8 @@ const manifest = JSON.parse(read("manifest.json"));
 assert.equal(manifest.manifest_version, 3);
 assert.deepEqual(manifest.permissions, ["nativeMessaging"], "the extension asks for nothing else");
 assert.equal(manifest.host_permissions, undefined);
-assert.ok(readFileSync(new URL("../src/native.rs", import.meta.url), "utf8").includes('EXTENSION_ID: &str = "badjomjdmajniieefpgbnglnocamhmck"'));
+// The store's copy and the one loaded from this folder (its id comes from the key).
+assert.ok(readFileSync(new URL("../src/native.rs", import.meta.url), "utf8").includes('EXTENSION_IDS: [&str; 2] = ["hbdpmjejoniaeejpnobbhpfbphppokgp", "badjomjdmajniieefpgbnglnocamhmck"]'));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const CLAUDE_BOX = '[data-testid="chat-input"]';

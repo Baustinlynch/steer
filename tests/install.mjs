@@ -125,7 +125,7 @@ try {
   if (!windows) {
     const host = JSON.parse(readFileSync(hostManifest, "utf8"));
     assert.equal(host.path, bin, "chrome starts the installed steer");
-    assert.deepEqual(host.allowed_origins, [EXTENSION], "and only for steer's extension");
+    assert.deepEqual(host.allowed_origins, ["chrome-extension://hbdpmjejoniaeejpnobbhpfbphppokgp/", EXTENSION], "and only for steer's extension");
   }
   if (!windows) assert.match(readFileSync(startup, "utf8"), /^echo hi\n\n# added by steer.*\nexport PATH=".*\.steer.bin:\$PATH"\n$/);
 

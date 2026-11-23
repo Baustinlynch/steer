@@ -15,8 +15,9 @@ use std::io::{Read, Write};
 
 /// What Chrome registers steer under, in the manifests `steer setup` writes.
 pub const HOST: &str = "app.steer.native";
-/// The extension's id, fixed by the public key in extension/manifest.json.
-pub const EXTENSION_ID: &str = "badjomjdmajniieefpgbnglnocamhmck";
+/// The extensions allowed to start steer: the Chrome Web Store's copy, and the one
+/// loaded from the repo's extension folder (its id is fixed by the key in the manifest).
+pub const EXTENSION_IDS: [&str; 2] = ["hbdpmjejoniaeejpnobbhpfbphppokgp", "badjomjdmajniieefpgbnglnocamhmck"];
 const VIAS: [&str; 2] = ["chatgpt", "claude-ai"];
 /// Chrome caps messages to a host at 4 GB, steer's are tiny.
 const MAX_MESSAGE: u32 = 1 << 20;
@@ -165,7 +166,7 @@ pub fn install(remove: bool) -> String {
         "description": "steer: counts from the steer browser extension",
         "path": live::bin_path(),
         "type": "stdio",
-        "allowed_origins": [format!("chrome-extension://{EXTENSION_ID}/")],
+        "allowed_origins": EXTENSION_IDS.iter().map(|id| format!("chrome-extension://{id}/")).collect::<Vec<_>>(),
     });
     let mut done = Vec::new();
     if cfg!(windows) {
