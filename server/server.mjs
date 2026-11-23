@@ -642,6 +642,7 @@ const STATIC = {
   "/steer.js": ["steer.js", "text/javascript; charset=utf-8"],
   "/style.css": ["style.css", "text/css; charset=utf-8"],
   "/trust": ["trust.html", "text/html; charset=utf-8"],
+  "/privacy": ["privacy.html", "text/html; charset=utf-8"],
   "/install.sh": ["install.sh", "text/plain; charset=utf-8"],
   "/install.ps1": ["install.ps1", "text/plain; charset=utf-8"],
 };
