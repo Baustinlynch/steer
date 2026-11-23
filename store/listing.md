@@ -78,21 +78,23 @@ Public, all regions, free.
 
 ## Test instructions (for Google's reviewers)
 
-Signing in normally needs a Hack Club account, so reviewers get a throwaway test
-account's key. Make it on the server just before submitting, and paste the key into the
-dashboard only, never into this repo.
+Signing in normally needs a Hack Club account, so reviewers get a throwaway account,
+store-review, on the live server. Its key goes in the dashboard only, never in this repo.
+
+**Username:** store-review
+
+**Password:** the store-review key
+
+**Additional instructions** (500 characters max):
 
 ```
-The extension needs the free steer app on the same computer, since it passes its counts to that app. To try it:
-
-1. On macOS or Linux, run in a terminal: curl -fsSL https://steer.duck.hackclub.app/install.sh | sh
-   On Windows, run in PowerShell: irm https://steer.duck.hackclub.app/install.ps1 | iex
-   When it asks "go ahead?", answer n for now (it would ask for a Hack Club login).
-2. Sign in with the test account: ~/.steer/bin/steer login KEY_GOES_HERE
-   (on Windows: ~\.steer\bin\steer.exe login KEY_GOES_HERE)
-3. Run ~/.steer/bin/steer install and answer y. It hooks into AI tools and registers the steer app with Chrome.
-4. Open the extension's popup. It shows "Tracking ChatGPT and Claude." and a project picker.
-5. Send a message on chatgpt.com or claude.ai. Within a few seconds it shows up on https://steer.duck.hackclub.app/u/store-review
-
-To remove everything afterwards: ~/.steer/bin/steer uninstall
+Needs the free steer app on the same computer.
+1. Mac/Linux: curl -fsSL https://steer.duck.hackclub.app/install.sh | sh
+Windows PowerShell: irm https://steer.duck.hackclub.app/install.ps1 | iex
+Answer n at "go ahead?"
+2. Run: ~/.steer/bin/steer login PASSWORD
+3. Run: ~/.steer/bin/steer install (answer y)
+4. The extension's popup says "Tracking ChatGPT and Claude."
+5. Send a message on chatgpt.com or claude.ai. It shows at steer.duck.hackclub.app/u/store-review
+Undo: ~/.steer/bin/steer uninstall
 ```
