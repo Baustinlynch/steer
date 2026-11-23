@@ -105,7 +105,17 @@ try {
   // 1. Install. Signing in through the browser can't happen here, so sign up first.
   console.log("step 1");
   await steer(built, ["signup", "ci", "--server", `http://127.0.0.1:${STEER_PORT}`]);
-  const installed = await steer(built, ["install", "--yes"]);
+  // Typed answers: go ahead, then yes to check-ins (asked where a dialog can show).
+  const installed = await steer(built, ["install"], { input: "y\ny\n" });
+  const checkinFlag = join(steerDir, "checkin");
+  if (installed.includes("turn on check-ins?")) {
+    assert.match(installed, /check-ins are on, thanks!/);
+    assert.ok(existsSync(checkinFlag));
+    // Off again, so the watcher started below doesn't pop questions up during the test.
+    assert.match(await steer(built, ["checkin", "off"]), /check-ins are off/);
+  } else {
+    assert.equal(process.platform, "linux", "mac and windows can always show the question");
+  }
   assert.match(installed, /found: claude code/);
   assert.match(installed, /done! your page: http:\/\/127\.0\.0\.1:\d+\/u\/ci/);
   assert.ok(existsSync(bin), "steer was copied into ~/.steer/bin");

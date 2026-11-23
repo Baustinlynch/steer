@@ -32,6 +32,16 @@ pub fn on() -> bool {
     flag().exists()
 }
 
+/// True if this computer can show the question (on linux that needs zenity).
+pub fn can_ask() -> bool {
+    dialog_tool().is_some()
+}
+
+/// How often it asks, for install's question.
+pub fn every_minutes() -> u64 {
+    block() / 60
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }

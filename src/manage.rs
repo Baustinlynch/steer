@@ -176,6 +176,22 @@ pub fn install(args: &[String]) -> Result<String, String> {
         None => false,
     };
 
+    // Check-in answers are how steer's counting gets checked against what people were
+    // really doing, so install asks. Only when someone's at the keyboard to answer.
+    if !yes && watch && !crate::checkin::on() && crate::checkin::can_ask() {
+        println!();
+        println!(
+            "one more thing: want to help check that steer's numbers are right? while you use an ai tool, it asks \"what are you doing right now?\" once every {} minutes, with 3 buttons. it closes by itself after 90 seconds if you're away, and answers never count as time. you can stop it anytime with: steer checkin off",
+            crate::checkin::every_minutes()
+        );
+        if ask("turn on check-ins?", true) {
+            match crate::checkin::command(&["checkin".into(), "on".into()]) {
+                Ok(_) => println!("check-ins are on, thanks!"),
+                Err(e) => println!("{e}"),
+            }
+        }
+    }
+
     let config = load_config().ok_or("not signed in")?;
     let mut out = String::from("\ndone!");
     if let Some(name) = &config.name {

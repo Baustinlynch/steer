@@ -16,7 +16,8 @@ chrome.runtime.sendNativeMessage(HOST, { kind: "projects" }, (answer) => {
     return;
   }
   state.className = "";
-  state.textContent = `Tracking ChatGPT and Claude as ${answer.user}.`;
+  // Signing in with just a key (steer login KEY) doesn't save the account's name.
+  state.textContent = answer.user ? `Tracking ChatGPT and Claude as ${answer.user}.` : "Tracking ChatGPT and Claude.";
   const names = [...new Set([answer.current, ...answer.recent, "browser"])].filter(Boolean);
   for (const name of names) {
     const option = document.createElement("option");
