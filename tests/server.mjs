@@ -471,18 +471,23 @@ try {
       events: [
         prompt({ session: "c1", project: "acc", t: at(4) }),
         ev({ session: "c1", project: "acc", t: at(3.5) }),
+        // The idle timer reporting someone at the computer, so the new signals count.
+        { id: `id-${n++}`, session: "presence", project: "presence", via: "steer", kind: "here", t: at(3.2) },
         answer("project-ai", 3),
         prompt({ session: "c1", project: "acc", t: at(2) }),
         answer("other", 1),
       ],
     });
-    assert.equal(sent.body.accepted, 5);
+    assert.equal(sent.body.accepted, 6);
     const acc = await get("/accuracy");
     assert.equal(acc.status, 200);
     // Another account above sent a check-in too.
     const [, answers, people] = acc.text.match(/(\d+) answers from (\d+) (?:person|people)/);
     assert.ok(Number(answers) >= 2 && Number(people) >= 1);
     assert.match(acc.text, /1 doing something else/);
+    assert.match(acc.text, /With the new signals/);
+    assert.match(acc.text, /2 answers from 1 person<\/b> while they were being measured/, "only the answers with the idle timer reporting");
+    assert.match(acc.text, /steer with the new signals/);
     assert.match(acc.text, /2 minute timeout \(Hackatime\)/);
     assert.ok(!acc.text.includes("checker"), "no names on it");
     assert.ok(existsSync(join(data, "checkin-accounts.json")), "the accounts with answers are remembered");

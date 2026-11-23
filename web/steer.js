@@ -620,6 +620,7 @@ export function buildReport(sessions, { days = 30, now = Date.now(), rule = RULE
     if (cutoff !== null && events[events.length - 1].t < cutoff) continue;
     const rep = analyzeSession({ ...s, events }, rule);
     if (rep.turns.length === 0) continue;
+    rep.path = s.path;
     // One project per key, named the way it was most recently (sessions go oldest first).
     const name = projectName(s.cwd);
     const key = projectKey(name);
@@ -1384,12 +1385,12 @@ export const MIN_ANSWERS_EACH = 10;
  * 0 to 1. `projects` comes from buildReport (caps applied), `sessions` is what it was
  * given, and `checkins` is [{ t, answer }].
  */
-export function checkinMoments(projects, sessions, checkins) {
+export function checkinMoments(projects, sessions, checkins, signals = null) {
   // Each turn counts the time just before the person's action.
   const counted = projects
-    .flatMap((p) => p.sessions.flatMap((s) => s.turns))
-    .filter((u) => u.human > 0)
-    .map((u) => [u.t - u.human * 1000, u.t]);
+    .flatMap((p) => p.sessions.flatMap((s) => s.turns.map((u) => ({ u, path: s.path }))))
+    .filter(({ u }) => u.human > 0)
+    .map(({ u, path }) => [u.t - u.human * 1000, u.t, path]);
   const times = sessions.flatMap((s) => s.events.map((e) => e.t)).sort((a, b) => a - b);
   /** How many event times are at or before t. */
   const upTo = (t) => {
@@ -1406,7 +1407,7 @@ export function checkinMoments(projects, sessions, checkins) {
     const i = upTo(c.t);
     const gap = i > 0 && i < times.length ? times[i] - times[i - 1] : Infinity;
     const two = gap <= 2 * 60_000 ? 1 : 0;
-    return {
+    const m = {
       answer: c.answer,
       on: c.answer === "project" || c.answer === "project-ai",
       steer: counted.some(([from, to]) => c.t >= from && c.t <= to) ? 1 : 0,
@@ -1414,7 +1415,130 @@ export function checkinMoments(projects, sessions, checkins) {
       two,
       fifteen: gap <= 15 * 60_000 ? 1 : 0,
     };
+    // The counting that uses the attention signals, only where they were being measured.
+    if (signals && inside(signals.known, c.t)) {
+      m.covered = true;
+      const before = counted.some(([from, to, path]) => !signals.chats.has(path) && c.t >= from && c.t <= to);
+      m.signals = !inside(signals.away, c.t) && (before || inside(signals.extra, c.t)) ? 1 : 0;
+      m.running = inside(signals.agentRuns, c.t);
+    }
+    return m;
   });
+}
+
+// ---------- counting from attention signals (tried next to the counting above) ----------
+
+/** "here" comes every 5 minutes while someone's at the computer. */
+const PRESENCE_REACH = 6 * 60_000;
+/** An "away" with no "back" after it (the watcher stopped): at most this long. */
+const AWAY_OPEN = 60 * 60_000;
+/** A permission prompt left longer than this wasn't being decided on the whole time. */
+const DECIDE_MAX = 10 * 60_000;
+/** A chat tab in front this long without anything else happening stops counting. */
+const FOCUS_MAX = 30 * 60_000;
+/** Writing one message for longer than this isn't all writing. */
+const TYPING_MAX = 15 * 60_000;
+/** A turn with no end in the log: the agent counts as working at most this long. */
+const TURN_MAX = 30 * 60_000;
+
+/** [from, to] ranges sorted and joined where they overlap. */
+function mergeRanges(ranges) {
+  const out = [];
+  for (const [a, b] of [...ranges].filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0])) {
+    const last = out[out.length - 1];
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+    else out.push([a, b]);
+  }
+  return out;
+}
+
+function inside(ranges, t) {
+  return ranges.some(([a, b]) => t >= a && t <= b);
+}
+
+/**
+ * What the attention signals say, as time ranges, from a person's stored signal events
+ * (away, back, here, wait, focus, typing) and their sessions:
+ * - known: when steer could tell whether they were at the computer
+ * - away: when they weren't
+ * - extra: time the signals show was theirs (deciding on a permission prompt, a chat tab
+ *   in front, writing a chat message)
+ * - chats: the browser chat sessions, which are counted from their signals alone
+ * - agentRuns: when an agent was working on something they asked for
+ */
+export function signalsOf(events, sessions) {
+  const sorted = [...events].sort((a, b) => a.t - b.t);
+  const away = [];
+  const known = [];
+  let awayFrom = null;
+  for (const e of sorted) {
+    if (e.kind === "away") {
+      awayFrom = e.t;
+    } else if (e.kind === "back") {
+      // How long they were gone comes with "back", so a lost "away" doesn't matter.
+      const from = Number.isFinite(e.away_secs) ? e.t - e.away_secs * 1000 : awayFrom;
+      if (from !== null && from < e.t) away.push([from, e.t]);
+      awayFrom = null;
+      known.push([e.t, e.t + PRESENCE_REACH]);
+    } else if (e.kind === "here") {
+      known.push([e.t, e.t + PRESENCE_REACH]);
+    }
+  }
+  if (awayFrom !== null) away.push([awayFrom, awayFrom + AWAY_OPEN]);
+
+  const bySession = new Map(sessions.map((s) => [s.path, s]));
+  const extra = [];
+  const chats = new Set();
+  for (const e of sorted) {
+    if (e.kind === "wait") {
+      // Deciding: until the tool started (the yes), or whatever the session did next.
+      const next = bySession.get(e.session)?.events.find((x) => x.t > e.t);
+      const end = next ? (Number.isFinite(next.ms) ? next.t - next.ms : next.t) : e.t;
+      extra.push([e.t, Math.min(Math.max(end, e.t), e.t + DECIDE_MAX)]);
+    } else if (e.kind === "typing") {
+      chats.add(e.session);
+      const sent = bySession.get(e.session)?.events.find((x) => x.kind === "prompt" && x.t >= e.t);
+      if (sent) extra.push([e.t, Math.min(sent.t, e.t + TYPING_MAX)]);
+    }
+  }
+  // A chat tab in front: from "on" until "off" (or at most FOCUS_MAX).
+  const open = new Map();
+  for (const e of sorted.filter((x) => x.kind === "focus")) {
+    chats.add(e.session);
+    const from = open.get(e.session);
+    if (e.on && from === undefined) open.set(e.session, e.t);
+    else if (!e.on && from !== undefined) {
+      extra.push([from, Math.min(e.t, from + FOCUS_MAX)]);
+      open.delete(e.session);
+    }
+  }
+  for (const from of open.values()) extra.push([from, from + FOCUS_MAX]);
+
+  // An agent working: from a prompt to the end of that turn.
+  const agentRuns = [];
+  for (const s of sessions) {
+    if (s.evidence) continue;
+    let from = null;
+    for (const e of s.events) {
+      if (e.kind === "prompt") {
+        if (from !== null) agentRuns.push([from, e.t]);
+        from = e.t;
+      } else if (from !== null && (e.stop || e.kind === "interrupt")) {
+        agentRuns.push([from, e.t]);
+        from = null;
+      }
+    }
+    if (from !== null) agentRuns.push([from, Math.min(from + TURN_MAX, s.events[s.events.length - 1].t)]);
+  }
+
+  const awayRanges = mergeRanges(away);
+  return {
+    known: mergeRanges([...known, ...awayRanges]),
+    away: awayRanges,
+    extra: mergeRanges(extra),
+    chats,
+    agentRuns: mergeRanges(agentRuns),
+  };
 }
 
 /** Adds up checkinMoments for several people (one list each). */
@@ -1429,12 +1553,42 @@ export function accuracy(people) {
   const judged = people.filter((p) => p.length >= MIN_ANSWERS_EACH);
   const byAnswer = {};
   for (const m of all) byAnswer[m.answer] = (byAnswer[m.answer] ?? 0) + 1;
+  // Only the answers from while the attention signals were measured, so both countings
+  // are scored on the same moments.
+  const measured = all.filter((m) => m.covered);
+  const signals = measured.length
+    ? {
+        answers: measured.length,
+        people: people.filter((p) => p.some((m) => m.covered)).length,
+        truth: mean(measured, working),
+        ways: [
+          { key: "steer", name: "steer, as it counts now" },
+          { key: "signals", name: "steer with the new signals" },
+        ].map((w) => {
+          const share = mean(measured, (m) => m[w.key]);
+          return {
+            ...w,
+            share,
+            whenOn: mean(measured.filter((m) => m.on), (m) => m[w.key]),
+            whenOff: mean(measured.filter((m) => !m.on), (m) => m[w.key]),
+            off: share - mean(measured, working),
+          };
+        }),
+        // Of the working moments the new counting still missed, how many were while an
+        // agent was working, which steer leaves out on purpose.
+        missedWhileRunning: (() => {
+          const missed = measured.filter((m) => m.on && !m.signals);
+          return missed.length ? { of: missed.length, share: mean(missed, (m) => (m.running ? 1 : 0)) } : null;
+        })(),
+      }
+    : null;
   return {
     people: people.length,
     judged: judged.length,
     answers: all.length,
     byAnswer,
     truth,
+    signals,
     ways: COUNTING_WAYS.map((w) => {
       const share = mean(all, (m) => m[w.key]);
       return {
@@ -1491,8 +1645,27 @@ ${a.ways
 <li><b>Each person off by</b>: how far each person's own total is from their own answers, on average, for the ${a.judged} ${a.judged === 1 ? "person" : "people"} with ${MIN_ANSWERS_EACH} or more answers. This is what decides whether someone gets their real hours, since a way of counting can be right on average and still give some people too much and others too little.</li>
 </ul>
 `;
+  html += renderSignals(a.signals, pct, points);
   if (updated) html += `<p class="muted">Worked out ${esc(updated)}.</p>\n`;
   return html + howAccuracy();
+}
+
+/** The part of the accuracy page about counting with the attention signals. */
+function renderSignals(sig, pct, points) {
+  let html = `<h2>With the new signals</h2>
+<p>Since steer 0.5.4, steer also knows when nobody's at the computer (its idle timer), when a permission prompt is waiting on the person, and when a ChatGPT or Claude tab is in front. Counted with those: the same as now, minus time away from the computer, plus deciding on permission prompts, and browser chats counted from the tab being in front and from writing each message. The agent working by itself still counts zero. It isn't what steer counts yet. It's here to see whether it's closer.</p>
+`;
+  if (!sig) return html + `<p>No answers yet from while these were being measured.</p>\n`;
+  html += `<p><b>${sig.answers} ${sig.answers === 1 ? "answer" : "answers"} from ${sig.people} ${sig.people === 1 ? "person" : "people"}</b> while they were being measured. People said they were working at ${pct(sig.truth)} of these moments.${sig.people < 15 ? " That's too few to tell which one is closer yet." : ""}</p>
+<table class="list">
+<tr><th>Way of counting</th><th>Counted</th><th>When they were working</th><th>When they weren't</th><th>Total off by</th></tr>
+${sig.ways.map((w) => `<tr><td>${esc(w.name)}</td><td>${pct(w.share)}</td><td>${pct(w.whenOn)}</td><td>${pct(w.whenOff)}</td><td>${points(w.off, true)}</td></tr>`).join("\n")}
+</table>
+`;
+  if (sig.missedWhileRunning) {
+    html += `<p>Of the ${sig.missedWhileRunning.of} working ${sig.missedWhileRunning.of === 1 ? "moment" : "moments"} the new counting still missed, ${pct(sig.missedWhileRunning.share)} were while an agent was working, which steer leaves out on purpose. That's the open question: whether watching the agent work is your time.</p>\n`;
+  }
+  return html;
 }
 
 function howAccuracy() {

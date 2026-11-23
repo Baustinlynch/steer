@@ -30,6 +30,7 @@ import {
   renderReport,
   renderReview,
   renderWeekly,
+  signalsOf,
   reviewFacts,
   rulesFrom,
   weekly,
@@ -363,7 +364,12 @@ async function sessionsOf(name) {
     } else if (e.kind === "interrupt") {
       s.events.push({ id: e.id, t, kind: "interrupt" });
     } else {
-      s.events.push({ id: e.id, t, kind: "agent", tools: e.kind === "tool" && e.tool ? [e.tool] : [] });
+      const a = { id: e.id, t, kind: "agent", tools: e.kind === "tool" && e.tool ? [e.tool] : [] };
+      // How long a tool ran (so its start is known), and which events end a turn. The
+      // counting ignores both; the attention signals use them.
+      if (Number.isInteger(e.ms)) a.ms = e.ms;
+      if (e.kind === "stop") a.stop = true;
+      s.events.push(a);
     }
   });
   const sessions = [...bySession.values()];
@@ -543,10 +549,15 @@ function workerMain() {
     const projects = await projectsOf(name, version);
     if (op === "checkins") {
       const answers = [];
+      const attention = [];
       await eachEvent(name, (e) => {
-        if (e.kind === "checkin" && !e.late && typeof e.answer === "string") answers.push({ t: Date.parse(e.t), answer: e.answer });
+        if (e.late) return;
+        if (e.kind === "checkin" && typeof e.answer === "string") answers.push({ t: Date.parse(e.t), answer: e.answer });
+        else if (ATTENTION.has(e.kind)) attention.push({ t: Date.parse(e.t), kind: e.kind, session: e.session, on: e.on, away_secs: e.away_secs });
       });
-      return answers.length ? checkinMoments(projects, await sessionsOf(name), answers) : [];
+      if (!answers.length) return [];
+      const sessions = await sessionsOf(name);
+      return checkinMoments(projects, sessions, answers, signalsOf(attention, sessions));
     }
     // Found by key, so the same project under another folder name is found too.
     const named = (x) => projectKey(x.name) === projectKey(project);

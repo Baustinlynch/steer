@@ -4,7 +4,7 @@
 //   node tests/counting.mjs
 
 import assert from "node:assert/strict";
-import { accuracy, analyzePrompt, applyCaps, buildReport, checkinMoments, checks, gapCredit, projectHuman, projectKey, projectOverlap, renderAccuracy, rulesFrom } from "../web/steer.js";
+import { accuracy, analyzePrompt, applyCaps, buildReport, checkinMoments, checks, gapCredit, projectHuman, projectKey, projectOverlap, renderAccuracy, rulesFrom, signalsOf } from "../web/steer.js";
 
 const T0 = Date.UTC(2026, 10, 20, 15, 0, 0);
 const sec = (s) => T0 + s * 1000;
@@ -300,6 +300,84 @@ assert.deepEqual(checks(reportOf([session("normal", honest())])), []);
   assert.equal(Math.round(b.ways.find((w) => w.key === "steer").offEach * 100), 10, "steer counted 40%, they worked 50%");
   assert.equal(Math.round(b.ways.find((w) => w.key === "fifteen").offEach * 100), 50);
   assert.match(renderAccuracy(accuracy([])), /No answers yet/);
+}
+
+// Counting with the attention signals, next to the counting above.
+{
+  const min = (m) => sec(m * 60);
+  // A Claude Code turn: prompt at 0, a tool that needed permission (asked at 1 min,
+  // started at 3 min, ran 30 s), the agent done at 4 min, the next prompt at 12 min.
+  const code = {
+    path: "cc1",
+    cwd: "/home/x/game",
+    title: null,
+    events: [
+      { id: "p1", t: min(0), kind: "prompt", prompt: { words: 20, chars: 100, images: 0, specific: 2, observation: false, generic: false, repeat: false } },
+      { id: "a1", t: min(3.5), kind: "agent", tools: ["Bash"], ms: 30_000 },
+      { id: "s1", t: min(4), kind: "agent", tools: [], stop: true },
+      { id: "p2", t: min(12), kind: "prompt", prompt: { words: 20, chars: 100, images: 0, specific: 2, observation: false, generic: false, repeat: false } },
+      { id: "s2", t: min(13), kind: "agent", tools: [], stop: true },
+    ],
+  };
+  // A ChatGPT chat: typing from 20 to 21 min, sent at 21, answered by 21.5.
+  const chat = {
+    path: "chatgpt:c1",
+    cwd: "game",
+    title: null,
+    events: [
+      { id: "cp", t: min(21), kind: "prompt", prompt: { words: 8, chars: 40, images: 0, specific: 1, observation: true, generic: false, repeat: false } },
+      { id: "cs", t: min(21.5), kind: "agent", tools: [], stop: true },
+    ],
+  };
+  const attention = [
+    { t: min(0), kind: "here" },
+    { t: min(1), kind: "wait", session: "cc1" },
+    { t: min(5), kind: "here" },
+    { t: min(6), kind: "away" }, // walked off at 6 ...
+    { t: min(9), kind: "back", away_secs: 180 }, // ... back at 9
+    { t: min(14), kind: "here" },
+    { t: min(19), kind: "here" },
+    { t: min(19.5), kind: "focus", session: "chatgpt:c1", on: true },
+    { t: min(20), kind: "typing", session: "chatgpt:c1" },
+    { t: min(23), kind: "focus", session: "chatgpt:c1", on: false },
+  ];
+  const sig = signalsOf(attention, [code, chat]);
+  assert.deepEqual(sig.away, [[min(6), min(9)]]);
+  assert.ok(sig.extra.some(([a, b]) => a === min(1) && b === min(3)), "deciding: from the prompt showing to the tool starting");
+  assert.ok(sig.extra.some(([a, b]) => a <= min(19.5) && b >= min(23)), "the chat tab in front");
+  assert.ok(sig.chats.has("chatgpt:c1"));
+  assert.deepEqual(sig.agentRuns, [[min(0), min(4)], [min(12), min(13)], [min(21), min(21.5)]]);
+
+  const projects = buildReport([code, chat], { days: null, now: sec(10 * 86400) });
+  const answers = [
+    { t: min(2), answer: "project" }, // deciding on the permission prompt
+    { t: min(7), answer: "other" }, // away from the computer
+    { t: min(22), answer: "project" }, // reading the chat answer
+    { t: min(3.2), answer: "project-ai" }, // watching the agent run the tool
+    { t: min(40), answer: "other" }, // nothing measured anymore
+  ];
+  const m = checkinMoments(projects, [code, chat], answers, sig);
+  assert.deepEqual(
+    m.map((x) => [x.covered ?? false, x.signals ?? null, x.running ?? null]),
+    [
+      [true, 1, true],
+      [true, 0, false],
+      [true, 1, false],
+      [true, 0, true],
+      [false, null, null],
+    ],
+  );
+  const a = accuracy([m]);
+  assert.equal(a.signals.answers, 4, "only answers from while signals were measured");
+  const withSignals = a.signals.ways.find((w) => w.key === "signals");
+  assert.equal(withSignals.whenOn, 2 / 3);
+  assert.equal(withSignals.whenOff, 0);
+  assert.deepEqual(a.signals.missedWhileRunning, { of: 1, share: 1 });
+  const html = renderAccuracy(a);
+  assert.match(html, /With the new signals/);
+  assert.match(html, /4 answers from 1 person<\/b> while they were being measured/);
+  assert.match(html, /100% were while an agent was working/);
+  assert.match(renderAccuracy(accuracy([checkinMoments(projects, [code, chat], answers)])), /No answers yet from while these were being measured/);
 }
 
 console.log("counting tests passed");
