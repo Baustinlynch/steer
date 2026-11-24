@@ -212,7 +212,9 @@ const EVIDENCE = new Set(["run", "save", "commit"]);
 const VIAS = new Set(["claude-code", "cursor", "codex", "opencode", "copilot", "freebuff", "chatgpt", "claude-ai", "steer"]);
 // Check-ins (`steer checkin on`): the person's answer to "what are you doing right now?",
 // used to fit the credit curve. They come from steer itself and never count as time.
-const ANSWERS = new Set(["project-ai", "project", "other", "none"]);
+// "project" and "project-ai" are the two working buttons from before 0.5.5, which split
+// working into "working" and "waiting" (on the ai).
+const ANSWERS = new Set(["working", "waiting", "project-ai", "project", "other", "none"]);
 // Claude Code sends interrupts from its tool hooks (a tool the person stopped).
 const INTERRUPTS = new Set(["codex", "copilot", "claude-code"]);
 // Signs of attention, collected so time can be counted from what the person does

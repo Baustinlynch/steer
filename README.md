@@ -116,7 +116,7 @@ each project's page on steer has a badge for your README that shows how long you
 steer checkin on
 ```
 
-while you use an ai tool, steer asks "what are you doing right now?" once at a random moment every 20 minutes, with three buttons: something else, my project on my own, my project with the ai. if you're away it closes by itself after 90 seconds. each answer sends only which button you picked and when, and never counts as time. the answers from everyone who turns this on are used to set how steer counts the time between prompts, instead of guessing, and to check it: https://steer.duck.hackclub.app/accuracy compares steer, a flat 1/3, and hackatime's and wakatime's timeouts with what people answered. `steer checkin off` stops it.
+while you use an ai tool, steer asks "what are you doing right now?" once at a random moment every 20 minutes, with three buttons: something else, waiting on the ai, working on my project. if you're away it closes by itself after 90 seconds. each answer sends only which button you picked and when, and never counts as time. the answers from everyone who turns this on are used to set how steer counts the time between prompts, instead of guessing, and to check it: https://steer.duck.hackclub.app/accuracy compares steer, a flat 1/3, and hackatime's and wakatime's timeouts with what people answered. `steer checkin off` stops it.
 
 `steer install` asks whether to turn this on. if you installed before it asked, steer asks once in a popup the next time you use an ai tool (at most 3 times a day apart if you don't click anything, and never again once you click either button).
 

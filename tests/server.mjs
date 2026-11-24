@@ -190,6 +190,9 @@ try {
     // Claude Code sends an interrupt when the person stops a running tool.
     ev({ kind: "interrupt", via: "claude-code" }),
     ev({ kind: "interrupt", via: undefined }),
+    // The check-in buttons since 0.5.5.
+    ev({ kind: "checkin", via: "steer", answer: "working", answered_after: 3 }),
+    ev({ kind: "checkin", via: "steer", answer: "waiting", answered_after: 2 }),
   ];
   const mixed = await post(alice, { events: [...bad, ...good] });
   assert.equal(mixed.status, 200);

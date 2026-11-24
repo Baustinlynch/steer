@@ -293,6 +293,19 @@ assert.deepEqual(checks(reportOf([session("normal", honest())])), []);
   const html = renderAccuracy(a);
   assert.match(html, /3 answers from 1 person/);
   assert.match(html, /too few people/);
+  // The buttons since 0.5.5: "working" is working, "waiting" on the ai isn't.
+  const after = checkinMoments(projects, sessions, [
+    { t: sec(400), answer: "working" },
+    { t: sec(650), answer: "waiting" }, // the agent's turn after the prompt: the timeouts count it, steer doesn't
+  ]);
+  assert.deepEqual(
+    after.map((x) => [x.on, x.steer, x.two]),
+    [
+      [true, 1, 0],
+      [false, 0, 1],
+    ],
+  );
+  assert.match(renderAccuracy(accuracy([after])), /1 working on their project, 1 waiting on the AI/);
   // Ten answers from one person: their own total gets compared too.
   const ten = Array.from({ length: 10 }, (_, i) => ({ answer: i < 5 ? "project" : "other", on: i < 5, steer: i < 4 ? 1 : 0, third: 0, two: 0, fifteen: 1 }));
   const b = accuracy([ten]);

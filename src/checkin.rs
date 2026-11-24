@@ -27,9 +27,12 @@ const DAY: u64 = 24 * 60 * 60;
 const OFFER_BUTTONS: [&str; 2] = ["no thanks", "yes, turn them on"];
 
 const QUESTION: &str = "what are you doing right now?";
-/// The buttons, and what each one is sent as.
+/// The buttons, and what each one is sent as. Waiting on the ai is its own answer, since
+/// the agent working by itself isn't the person's time. Before 0.5.5 the buttons were
+/// "my project, on my own" ("project") and "my project, with the ai" ("project-ai"), and
+/// the second one mixed working with the ai and waiting on it.
 const BUTTONS: [(&str, &str); 3] =
-    [("something else", "other"), ("my project, on my own", "project"), ("my project, with the ai", "project-ai")];
+    [("something else", "other"), ("waiting on the ai", "waiting"), ("working on my project", "working")];
 
 fn flag() -> PathBuf {
     dir().join("checkin")

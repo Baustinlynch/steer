@@ -1379,6 +1379,11 @@ export const COUNTING_WAYS = [
 /** Answers a person needs before their own total is compared with their answers. */
 export const MIN_ANSWERS_EACH = 10;
 
+/** The check-in answers that mean the person was working on their project. "project"
+ * and "project-ai" are the buttons from before steer 0.5.5. Waiting on the ai isn't
+ * working, since the hours are meant to be the person's own work, not the agent's. */
+const WORKING = new Set(["working", "project", "project-ai"]);
+
 /**
  * For each check-in answer ("what are you doing right now?"), whether the person was on
  * their project, and how much of that moment each way of counting would have counted,
@@ -1409,7 +1414,7 @@ export function checkinMoments(projects, sessions, checkins, signals = null) {
     const two = gap <= 2 * 60_000 ? 1 : 0;
     const m = {
       answer: c.answer,
-      on: c.answer === "project" || c.answer === "project-ai",
+      on: WORKING.has(c.answer),
       steer: counted.some(([from, to]) => c.t >= from && c.t <= to) ? 1 : 0,
       third: two / 3,
       two,
@@ -1614,8 +1619,10 @@ export function renderAccuracy(a, { updated = null } = {}) {
     return `${signed && n > 0 ? "+" : ""}${n} points`;
   };
   const kinds = [
+    ["working", "working on their project"],
     ["project-ai", "on their project with the AI"],
     ["project", "on their project on their own"],
+    ["waiting", "waiting on the AI"],
     ["other", "doing something else"],
     ["none", "no answer"],
   ]
@@ -1641,7 +1648,7 @@ ${a.ways
 <ul>
 <li><b>Counted</b>: how much of these moments it counted. The closer to ${pct(a.truth)}, the better.</li>
 <li><b>When they were working</b>: of the moments people were on their project, how much it counted. Higher is better.</li>
-<li><b>When they weren't</b>: of the moments they were doing something else or away, how much it counted. Lower is better.</li>
+<li><b>When they weren't</b>: of the moments they were waiting on the AI, doing something else or away, how much it counted. Lower is better.</li>
 <li><b>Each person off by</b>: how far each person's own total is from their own answers, on average, for the ${a.judged} ${a.judged === 1 ? "person" : "people"} with ${MIN_ANSWERS_EACH} or more answers. This is what decides whether someone gets their real hours, since a way of counting can be right on average and still give some people too much and others too little.</li>
 </ul>
 `;
@@ -1672,7 +1679,8 @@ function howAccuracy() {
   return `<h2>How it's worked out</h2>
 <ul>
 <li>Check-ins only happen while someone used an AI tool in the last hour, so this is all about time around AI work.</li>
-<li>Working means they picked "my project, on my own" or "my project, with the ai". "Something else" and no answer count as not working. The question closes by itself after 90 seconds, which usually means they were away.</li>
+<li>Working means they picked "working on my project". "Waiting on the ai", "something else" and no answer count as not working, since the hours are meant to be the person's own work, not the agent's. The question closes by itself after 90 seconds, which usually means they were away.</li>
+<li>Before steer 0.5.5 the buttons were "my project, on my own" and "my project, with the ai", and both count as working. "With the ai" could also mean waiting on it, so on those answers steer, which leaves out the agent's time, looks like it missed more than it did, and the timeouts look better than they are.</li>
 <li>steer: whether the moment falls in time steer counted, with the counting steer uses today.</li>
 <li>The timeouts count a moment if steer saw activity within that many minutes before and after it, which is how Hackatime and WakaTime count editor activity. Here they only see AI tool activity, not the editor.</li>
 <li>A flat 1/3 is a third of what the 2 minute timeout counts, like programs that cut AI hours to a third.</li>
