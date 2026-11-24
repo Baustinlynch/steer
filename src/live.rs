@@ -142,7 +142,7 @@ fn record_cursor(which: &str) -> Option<()> {
         }
         "tool" => {
             let tool = v.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
-            tool_event(new_id(), session, &project, "cursor", Utc::now(), tool)
+            tool_event(new_id(), session, &project, "cursor", Utc::now(), tool, None, None)
         }
         "stop" => event(new_id(), session, &project, "cursor", Utc::now(), "stop"),
         _ => return None,
@@ -180,7 +180,7 @@ fn record() -> Option<()> {
         }
         "PostToolUse" => {
             let tool = v.get("tool_name").and_then(Value::as_str).unwrap_or("");
-            tool_event(new_id(), session, &project, "claude-code", Utc::now(), tool)
+            tool_event(new_id(), session, &project, "claude-code", Utc::now(), tool, None, None)
         }
         "Stop" => event(new_id(), session, &project, "claude-code", Utc::now(), "stop"),
         _ => return None,
@@ -206,9 +206,20 @@ pub(crate) fn event(id: String, session: &str, project: &str, via: &str, t: Date
     })
 }
 
-pub(crate) fn tool_event(id: String, session: &str, project: &str, via: &str, t: DateTime<Utc>, tool: &str) -> Value {
+pub(crate) fn tool_event(
+    id: String,
+    session: &str,
+    project: &str,
+    via: &str,
+    t: DateTime<Utc>,
+    tool: &str,
+    model: Option<&str>,
+    tokens: Option<u64>,
+) -> Value {
     let mut e = event(id, session, project, via, t, "tool");
     e["tool"] = tool.into();
+    e["model"] = model.map(str::to_owned).into();
+    e["tokens"] = tokens.into();
     e
 }
 
@@ -229,6 +240,8 @@ pub(crate) fn prompt_event(
     e["observation"] = p.observation.into();
     e["generic"] = p.generic.into();
     e["repeat"] = is_repeat(session, p).into();
+    e["model"] = p.model.clone().into();
+    e["tokens"] = p.tokens.into();
     e
 }
 

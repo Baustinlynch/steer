@@ -226,6 +226,9 @@ const TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2}
 const LONGEST = 256; // strings longer than this didn't come from steer
 // Upper bounds for prompt counts. Anything over these is made up.
 const COUNTS = { words: 100_000, chars: 1_000_000, images: 100, specific: 100_002 };
+// A model name, and a per-turn token count (input + output). Real turns are far under this.
+const MODEL_MAX = 80;
+const TOKENS_MAX = 100_000_000;
 
 /** Checks one event from a client. Returns the stored form or null. */
 function accept(raw, now) {
@@ -258,6 +261,13 @@ function accept(raw, now) {
     got: new Date(now).toISOString(),
     late: now - t > LATE_SECS * 1000 || t - now > FUTURE_SECS * 1000,
   };
+  // Optional: which model wrote the turn, and how many tokens it used (input + output).
+  const model = raw.model;
+  if (model != null && (typeof model !== "string" || model.length > MODEL_MAX)) return null;
+  const tok = raw.tokens;
+  if (tok != null && (!Number.isInteger(tok) || tok < 0 || tok > TOKENS_MAX)) return null;
+  if (model != null) e.model = model;
+  if (tok != null) e.tokens = tok;
   if (kind === "prompt") {
     const n = {};
     for (const [k, max] of Object.entries(COUNTS)) {
@@ -319,7 +329,7 @@ async function sessionsOf(name) {
     }
     const t = Date.parse(e.t);
     if (evidence) {
-      s.events.push({ id: e.id, t, kind: e.kind, name: e.name, exit: e.exit, count: e.count, hash: e.hash });
+      s.events.push({ id: e.id, t, kind: e.kind, name: e.name, exit: e.exit, count: e.count, hash: e.hash, model: e.model, tokens: e.tokens });
     } else if (e.kind === "prompt") {
       const prompt = {
         chars: e.chars,
@@ -329,12 +339,14 @@ async function sessionsOf(name) {
         observation: e.observation,
         generic: e.generic,
         repeat: e.repeat,
+        model: e.model,
+        tokens: e.tokens,
       };
       s.events.push({ id: e.id, t, kind: "prompt", prompt });
     } else if (e.kind === "interrupt") {
       s.events.push({ id: e.id, t, kind: "interrupt" });
     } else {
-      s.events.push({ id: e.id, t, kind: "agent", tools: e.kind === "tool" && e.tool ? [e.tool] : [] });
+      s.events.push({ id: e.id, t, kind: "agent", tools: e.kind === "tool" && e.tool ? [e.tool] : [], model: e.model, tokens: e.tokens });
     }
   });
   const sessions = [...bySession.values()];
